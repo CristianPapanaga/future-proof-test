@@ -10,13 +10,15 @@ The raw files carry a UTF-8 BOM and store money as ``€``-formatted strings
 floats, coerces the numeric columns, and assigns sensible dtypes (nullable
 integers/floats and categoricals) while preserving missing values. Values that
 are legitimately absent ("not applicable") are marked with the string ``"NA"``
-so they can be told apart from genuinely missing values (``pd.NA``).
+so they can be told apart from genuinely missing values (``pd.NA``). An
+optional listwise-deletion step (:func:`drop_missing_rows`) removes rows with
+genuinely missing values while leaving the ``"NA"`` markers intact.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -186,13 +188,58 @@ def clean_historical_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_historical_data(
-    path: str | Path | None = None, *, clean: bool = True
+def drop_missing_rows(
+    df: pd.DataFrame, columns: Sequence[str] | None = None
 ) -> pd.DataFrame:
-    """Load (and, by default, clean) the historical concept-test dataset."""
+    """Drop rows with genuinely missing values in ``columns`` (listwise deletion).
+
+    Only truly missing values (``pd.NA``) are treated as missing; structural
+    ``"NA"`` (absent by design) markers are valid and are left intact.
+
+    * ``columns=None`` — full listwise deletion: drop rows missing in *any*
+      column.
+    * ``columns=[...]`` — per-model deletion: drop rows only when one of the
+      listed columns is missing, leaving missingness in other columns intact.
+
+    Returns a new DataFrame.
+    """
+    if columns is None:
+        return df.dropna()
+    columns = list(columns)
+    if not columns:
+        return df.copy()
+    return df.dropna(subset=columns)
+
+
+def load_historical_data(
+    path: str | Path | None = None,
+    *,
+    clean: bool = True,
+    drop_missing: bool | Sequence[str] = False,
+) -> pd.DataFrame:
+    """Load (and, by default, clean) the historical concept-test dataset.
+
+    ``drop_missing`` controls listwise deletion after cleaning:
+
+    * ``False`` (default) — no rows are dropped.
+    * ``True`` — full listwise deletion (rows missing in any column).
+    * a sequence of column names — per-model deletion (rows missing in any of
+      those columns only).
+
+    Only truly missing values (``pd.NA``) are treated as missing; structural
+    ``"NA"`` (absent by design) values are never deleted. Deletion relies on
+    the ``"NA"`` markers, so cleaning is implicitly enabled whenever
+    ``drop_missing`` is not ``False``.
+    """
     source = Path(path) if path is not None else get_data_path(HISTORICAL_DATA_FILENAME)
     df = read_csv(source)
-    return clean_historical_data(df) if clean else df
+    if clean or drop_missing is not False:
+        df = clean_historical_data(df)
+    if drop_missing is True:
+        df = drop_missing_rows(df)
+    elif drop_missing is not False:
+        df = drop_missing_rows(df, columns=drop_missing)
+    return df
 
 
 def load_data_dictionary(path: str | Path | None = None) -> pd.DataFrame:
@@ -212,6 +259,7 @@ __all__ = [
     "NA_MARKER",
     "CONDITIONAL_COLUMNS",
     "clean_historical_data",
+    "drop_missing_rows",
     "get_data_path",
     "load_data_dictionary",
     "load_historical_data",

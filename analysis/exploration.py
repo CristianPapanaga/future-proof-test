@@ -21,6 +21,7 @@ Summary-statistics choices (reproduced in the log):
 from __future__ import annotations
 
 import pandas as pd
+from pyampute.exploration.mcar_statistical_tests import MCARTest
 
 import data_utilities
 import log_writer
@@ -161,6 +162,80 @@ def _missingness_summary(df: pd.DataFrame) -> dict:
     }
 
 
+def _fmt_p_value(p: float) -> str:
+    """Format a p-value for display, flooring very small values."""
+    return "< 0.001" if p < 0.001 else f"{p:.3f}"
+
+
+def _mcar_matrix(df: pd.DataFrame, columns: list[str], mask: pd.Series) -> pd.DataFrame:
+    """Build a numeric matrix (NaN = missing) for the MCAR test.
+
+    Only genuinely missing values (``pd.NA``) become NaN. Structural ``"NA"``
+    (absent by design) markers are excluded by restricting ``mask`` to the
+    rows where the columns are actually applicable.
+    """
+    subset = df.loc[mask, columns]
+    return pd.DataFrame(
+        {
+            column: pd.to_numeric(subset[column], errors="coerce").astype("float64")
+            for column in columns
+        }
+    )
+
+
+def _run_mcar_tests(df: pd.DataFrame) -> list[dict]:
+    """Run Little's MCAR test (via ``pyampute``) on three applicable subsets."""
+    tests = [
+        {
+            "Test": "Core research variables (all concepts)",
+            "columns": [
+                "Sample_Size",
+                "Turnaround_Days",
+                "Research_Cost_EUR",
+                "Stated_Appeal",
+                "Purchase_Intent",
+            ],
+            "mask": pd.Series(True, index=df.index),
+        },
+        {
+            "Test": "Launch performance (launched concepts)",
+            "columns": [
+                "Launch_Support_EUR",
+                "Distribution_Pct",
+                "Sales_vs_Target_Pct",
+                "Repeat_Purchase_Pct",
+            ],
+            "mask": df["Launched"] == 1,
+        },
+        {
+            "Test": "Implicit/behavioural (Combined packages)",
+            "columns": [
+                "Behavioural_Choice_Pct",
+                "Implicit_Score",
+                "Stated_Appeal",
+                "Purchase_Intent",
+            ],
+            "mask": df["Research_Package"] == "Combined",
+        },
+    ]
+    mt = MCARTest(method="little")
+    results = []
+    for test in tests:
+        x = _mcar_matrix(df, test["columns"], test["mask"])
+        p = float(mt.little_mcar_test(x))
+        results.append(
+            {
+                "Test": test["Test"],
+                "n": int(len(x)),
+                "Variables": ", ".join(test["columns"]),
+                "p": p,
+                "p-value": _fmt_p_value(p),
+                "Conclusion": "Reject MCAR" if p < 0.05 else "Fail to reject MCAR",
+            }
+        )
+    return results
+
+
 def main() -> None:
     """Run the exploratory analysis and write the exploration log."""
     df = data_utilities.load_historical_data()
@@ -242,6 +317,128 @@ def main() -> None:
 
         log.heading("Overall missingness", level=3)
         log.key_values(_missingness_summary(df))
+
+        log.heading("Missingness mechanism", level=3)
+        log.paragraph(
+            "The overall true-missingness rate is low (1.56%), but it is far "
+            "from uniform across fields. Two fields stand out: "
+            "``Implicit_Score`` (10.2% of applicable values missing) and "
+            "``Repeat_Purchase_Pct`` (11.2%), versus 2–8% elsewhere. This "
+            "concentration is evidence against MCAR (missing completely at "
+            "random), under which missingness would be spread evenly at a "
+            "uniformly low rate with no relation to any variable."
+        )
+        log.paragraph(
+            "Instead, the pattern is consistent with MAR or MNAR. "
+            "``Implicit_Score`` is only collected for Combined packages, and "
+            "its elevated failure rate suggests the missingness depends on "
+            "observed design features (MAR) or on the unobserved score itself "
+            "(e.g. an implicit-association task that fails to yield a stable "
+            "measure — MNAR). Likewise, ``Repeat_Purchase_Pct`` is measured "
+            "only for launched concepts and appears to drop out for a "
+            "non-random subset of them, plausibly tied to category, support "
+            "spend, or the repeat-purchase behaviour itself."
+        )
+        log.paragraph(
+            "Consequence: the concentration in ``Implicit_Score`` and "
+            "``Repeat_Purchase_Pct`` is worth flagging, but its practical "
+            "impact hinges on the *overall* volume of missingness and on a "
+            "formal test of the missingness mechanism — both addressed in "
+            "section 5, which concludes that complete-case analysis is "
+            "sufficient."
+        )
+
+        # 5. Little's MCAR test ----------------------------------------------
+        log.heading("5. Little's MCAR test", level=2)
+        log.paragraph(
+            "Little's (1988) test evaluates the null hypothesis that missing "
+            "values are Missing Completely At Random (MCAR); a small p-value "
+            "(below 0.05) rejects MCAR in favour of MAR or MNAR. The test is "
+            "run with ``pyampute.exploration.mcar_statistical_tests."
+            "MCARTest(method='little')``. Because the structural ``\"NA\"`` "
+            "(absent by design) values are not statistically missing, each "
+            "test is restricted to the subset of rows where its variables are "
+            "actually applicable."
+        )
+        results = _run_mcar_tests(df)
+        table = pd.DataFrame(results)[
+            ["Test", "n", "Variables", "p-value", "Conclusion"]
+        ]
+        log.table(table)
+
+        log.heading("Interpretation", level=3)
+        for r in results:
+            if r["p"] < 0.05:
+                verdict = (
+                    "the null hypothesis of MCAR is rejected — the missingness "
+                    "is unlikely to be completely at random (consistent with "
+                    "MAR or MNAR)."
+                )
+            else:
+                verdict = "there is no evidence against MCAR."
+            log.paragraph(
+                f"**{r['Test']}** (n = {r['n']}) — p = {r['p-value']}: {verdict}"
+            )
+        log.paragraph(
+            "None of the three subsets rejects MCAR at the 5% level, so the "
+            "formal test does not confirm the earlier qualitative concern that "
+            "``Implicit_Score`` and ``Repeat_Purchase_Pct`` are MAR/MNAR. This "
+            "should be read with the usual caveats — Little's test has limited "
+            "power, assumes multivariate normality, and failing to reject MCAR "
+            "is not proof of MCAR (see Schouten et al., 2021, and the "
+            "``pyampute`` documentation). Crucially, the *overall* amount of "
+            "truly missing data is very small (1.56% of all cells), which is "
+            "well below the ≈5% threshold below which multiple imputation is "
+            "generally considered unnecessary (Dettori et al., 2018)."
+        )
+
+        # Per-model deletion figures ------------------------------------------
+        full_dropped = len(df) - len(data_utilities.drop_missing_rows(df))
+        core_cols = [
+            "Sample_Size",
+            "Turnaround_Days",
+            "Research_Cost_EUR",
+            "Stated_Appeal",
+            "Purchase_Intent",
+        ]
+        core_dropped = len(df) - len(data_utilities.drop_missing_rows(df, core_cols))
+        launched_df = df[df["Launched"] == 1]
+        launch_cols = [
+            "Launch_Support_EUR",
+            "Distribution_Pct",
+            "Sales_vs_Target_Pct",
+            "Repeat_Purchase_Pct",
+        ]
+        launch_dropped = len(launched_df) - len(
+            data_utilities.drop_missing_rows(launched_df, launch_cols)
+        )
+
+        log.heading("Handling recommendation", level=3)
+        log.paragraph(
+            "Given (i) the very small overall missingness — 1.56% of cells, "
+            "well under the ≈5% rule of thumb in Dettori et al. (2018) — and "
+            "(ii) no evidence against MCAR from Little's test, **multiple "
+            "imputation is not appropriate** here. However, *full* listwise "
+            f"deletion across all 18 columns would drop {full_dropped} of "
+            f"{len(df)} rows ({full_dropped / len(df) * 100:.1f}%), because the "
+            "211 missing cells are spread over 8 columns. The recommended "
+            "approach is therefore **per-model deletion**: drop rows missing "
+            "in only the columns a given model actually uses "
+            "(``data_utilities.drop_missing_rows`` with an explicit column "
+            "subset)."
+        )
+        log.paragraph(
+            "The savings are substantial for the core research model — dropping "
+            "rows missing in the five core variables removes only "
+            f"{core_dropped} rows ({core_dropped / len(df) * 100:.1f}%) rather "
+            f"than {full_dropped}. Models centred on the launch metrics remain "
+            f"the costly case: within the {len(launched_df)} launched concepts, "
+            "dropping rows missing in any launch metric removes "
+            f"{launch_dropped} ({launch_dropped / len(launched_df) * 100:.1f}%), "
+            "reflecting the concentration of missingness in those fields. Each "
+            "model should therefore specify exactly the columns it uses, so "
+            "missingness in irrelevant columns does not cause data loss."
+        )
 
     print(f"Exploration log written to: {log.path}")
 

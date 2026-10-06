@@ -1,5 +1,5 @@
 # Exploratory Data Analysis — Historical Concept Tests
-*Generated 2026-10-06 23:08:24*
+*Generated 2026-10-07 00:24:30*
 
 ## 1. Dataset overview
 The cleaned historical dataset contains one row per concept test. Currency columns were parsed to floats and categorical columns to category dtype (see ``data_utilities.py``).
@@ -106,4 +106,34 @@ During cleaning, values that are legitimately absent are marked with the string 
 | Absent by design (valid, not missing) | 2242 |
 | Truly missing cells (applicable but missing) | 211 |
 | True missingness (% of all data) | 1.56% |
+
+### Missingness mechanism
+The overall true-missingness rate is low (1.56%), but it is far from uniform across fields. Two fields stand out: ``Implicit_Score`` (10.2% of applicable values missing) and ``Repeat_Purchase_Pct`` (11.2%), versus 2–8% elsewhere. This concentration is evidence against MCAR (missing completely at random), under which missingness would be spread evenly at a uniformly low rate with no relation to any variable.
+
+Instead, the pattern is consistent with MAR or MNAR. ``Implicit_Score`` is only collected for Combined packages, and its elevated failure rate suggests the missingness depends on observed design features (MAR) or on the unobserved score itself (e.g. an implicit-association task that fails to yield a stable measure — MNAR). Likewise, ``Repeat_Purchase_Pct`` is measured only for launched concepts and appears to drop out for a non-random subset of them, plausibly tied to category, support spend, or the repeat-purchase behaviour itself.
+
+Consequence: the concentration in ``Implicit_Score`` and ``Repeat_Purchase_Pct`` is worth flagging, but its practical impact hinges on the *overall* volume of missingness and on a formal test of the missingness mechanism — both addressed in section 5, which concludes that complete-case analysis is sufficient.
+
+## 5. Little's MCAR test
+Little's (1988) test evaluates the null hypothesis that missing values are Missing Completely At Random (MCAR); a small p-value (below 0.05) rejects MCAR in favour of MAR or MNAR. The test is run with ``pyampute.exploration.mcar_statistical_tests.MCARTest(method='little')``. Because the structural ``"NA"`` (absent by design) values are not statistically missing, each test is restricted to the subset of rows where its variables are actually applicable.
+
+| Test | n | Variables | p-value | Conclusion |
+| --- | --- | --- | --- | --- |
+| Core research variables (all concepts) | 750 | Sample_Size, Turnaround_Days, Research_Cost_EUR, Stated_Appeal, Purchase_Intent | 0.333 | Fail to reject MCAR |
+| Launch performance (launched concepts) | 403 | Launch_Support_EUR, Distribution_Pct, Sales_vs_Target_Pct, Repeat_Purchase_Pct | 0.303 | Fail to reject MCAR |
+| Implicit/behavioural (Combined packages) | 186 | Behavioural_Choice_Pct, Implicit_Score, Stated_Appeal, Purchase_Intent | 0.694 | Fail to reject MCAR |
+
+### Interpretation
+**Core research variables (all concepts)** (n = 750) — p = 0.333: there is no evidence against MCAR.
+
+**Launch performance (launched concepts)** (n = 403) — p = 0.303: there is no evidence against MCAR.
+
+**Implicit/behavioural (Combined packages)** (n = 186) — p = 0.694: there is no evidence against MCAR.
+
+None of the three subsets rejects MCAR at the 5% level, so the formal test does not confirm the earlier qualitative concern that ``Implicit_Score`` and ``Repeat_Purchase_Pct`` are MAR/MNAR. This should be read with the usual caveats — Little's test has limited power, assumes multivariate normality, and failing to reject MCAR is not proof of MCAR (see Schouten et al., 2021, and the ``pyampute`` documentation). Crucially, the *overall* amount of truly missing data is very small (1.56% of all cells), which is well below the ≈5% threshold below which multiple imputation is generally considered unnecessary (Dettori et al., 2018).
+
+### Handling recommendation
+Given (i) the very small overall missingness — 1.56% of cells, well under the ≈5% rule of thumb in Dettori et al. (2018) — and (ii) no evidence against MCAR from Little's test, **multiple imputation is not appropriate** here. However, *full* listwise deletion across all 18 columns would drop 184 of 750 rows (24.5%), because the 211 missing cells are spread over 8 columns. The recommended approach is therefore **per-model deletion**: drop rows missing in only the columns a given model actually uses (``data_utilities.drop_missing_rows`` with an explicit column subset).
+
+The savings are substantial for the core research model — dropping rows missing in the five core variables removes only 36 rows (4.8%) rather than 184. Models centred on the launch metrics remain the costly case: within the 403 launched concepts, dropping rows missing in any launch metric removes 111 (27.5%), reflecting the concentration of missingness in those fields. Each model should therefore specify exactly the columns it uses, so missingness in irrelevant columns does not cause data loss.
 
