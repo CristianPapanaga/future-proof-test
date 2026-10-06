@@ -8,7 +8,9 @@ stay consistent across the whole project.
 The raw files carry a UTF-8 BOM and store money as ``€``-formatted strings
 (e.g. ``"€13,940.00"``); this module strips the BOM, parses those strings into
 floats, coerces the numeric columns, and assigns sensible dtypes (nullable
-integers/floats and categoricals) while preserving missing values.
+integers/floats and categoricals) while preserving missing values. Values that
+are legitimately absent ("not applicable") are marked with the string ``"NA"``
+so they can be told apart from genuinely missing values (``pd.NA``).
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 HISTORICAL_DATA_FILENAME = "historical_data.csv"
@@ -55,6 +57,42 @@ FLOAT_COLUMNS: list[str] = [
 ]
 
 TEXT_COLUMNS: list[str] = ["Concept_ID"]
+
+#: Marker used for values that are legitimately absent ("not applicable"),
+#: distinct from genuinely missing values (``pd.NA``).
+NA_MARKER: str = "NA"
+
+#: Columns that are only applicable under a condition. Their legitimately
+#: absent ("not applicable") values are replaced with :data:`NA_MARKER` during
+#: cleaning so they can be told apart from genuinely missing values.
+CONDITIONAL_COLUMNS: list[str] = [
+    "Behavioural_Choice_Pct",
+    "Implicit_Score",
+    "Launch_Support_EUR",
+    "Distribution_Pct",
+    "Sales_vs_Target_Pct",
+    "Repeat_Purchase_Pct",
+]
+
+
+def _not_applicable(df: pd.DataFrame, column: str) -> pd.Series:
+    """Return a boolean mask of cells whose value is legitimately absent.
+
+    A cell is "not applicable" when the concept's design means the metric was
+    never meant to be collected (e.g. launch metrics for unlaunched concepts).
+    """
+    if column == "Behavioural_Choice_Pct":
+        return ~df["Research_Package"].isin(["Behavioural", "Combined"])
+    if column == "Implicit_Score":
+        return df["Research_Package"] != "Combined"
+    if column in (
+        "Launch_Support_EUR",
+        "Distribution_Pct",
+        "Sales_vs_Target_Pct",
+        "Repeat_Purchase_Pct",
+    ):
+        return df["Launched"] != 1
+    return pd.Series(False, index=df.index)
 
 
 def get_data_path(filename: str) -> Path:
@@ -108,7 +146,9 @@ def clean_historical_data(df: pd.DataFrame) -> pd.DataFrame:
     * ``€``-formatted currency columns parsed into nullable floats,
     * numeric columns coerced to nullable ``Float64`` / ``Int64``,
     * categorical columns cast to ``category`` (with whitespace trimmed),
-    * the ``Concept_ID`` text column trimmed and stored as ``string``.
+    * the ``Concept_ID`` text column trimmed and stored as ``string``,
+    * "not applicable" values replaced with the ``"NA"`` marker so they are
+      distinguishable from genuinely missing values (``pd.NA``).
     """
     df = df.copy()
     df.columns = [str(column).strip() for column in df.columns]
@@ -134,6 +174,14 @@ def clean_historical_data(df: pd.DataFrame) -> pd.DataFrame:
     for column in TEXT_COLUMNS:
         if column in df.columns:
             df[column] = df[column].astype("string").str.strip()
+
+    # Replace "not applicable" (absent by design) values with the "NA" marker
+    # so they are distinguishable from genuinely missing values (pd.NA). Cast
+    # to object first so the column can hold both numbers and the "NA" string.
+    for column in CONDITIONAL_COLUMNS:
+        if column in df.columns:
+            not_applicable = _not_applicable(df, column)
+            df[column] = df[column].astype(object).mask(not_applicable, NA_MARKER)
 
     return df
 
@@ -161,6 +209,8 @@ def load_data_dictionary(path: str | Path | None = None) -> pd.DataFrame:
 __all__ = [
     "DATA_DIR",
     "PROJECT_ROOT",
+    "NA_MARKER",
+    "CONDITIONAL_COLUMNS",
     "clean_historical_data",
     "get_data_path",
     "load_data_dictionary",
