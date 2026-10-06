@@ -1,0 +1,19 @@
+﻿Field,Type,Definition and coding
+Concept_ID,Text,Unique historical concept test identifier. One row per concept.
+Test_Year,Integer,"Year the research was completed, 2022 to 2025."
+Category,Category,"Product category, Snacks, Drinks or Personal care."
+Innovation_Type,Category,"Extent of change, Incremental improvement or New proposition."
+Research_Package,Category,"Survey, Behavioural or Combined. Package contents are described in the dataset notes."
+Sample_Size,Integer,Number of consumers who completed the core questionnaire.
+Research_Cost_EUR,Number,"Total fee in euros for the historical test, excluding VAT, including recruitment and reporting."
+Turnaround_Days,Integer,Calendar days from confirmed brief to delivery of the research report.
+Stated_Appeal,Number,"Mean concept appeal rating, 1 unappealing to 7 appealing."
+Purchase_Intent,Number,"Mean stated purchase likelihood, 1 very unlikely to 7 very likely."
+Behavioural_Choice_Pct,Number,"Percentage choosing the concept in a simulated choice among four options, 0 to 100."
+Implicit_Score,Number,"Association task score, 0 to 100. Higher means faster positive than negative associations, using one common scoring scale."
+Recommendation,Category,"Original research recommendation, Progress, Refine or Stop, recorded before launch."
+Launched,Binary,"Concept subsequently launched, 1 yes, 0 no. The business could override the recommendation."
+Launch_Support_EUR,Number,Marketing spend in euros during the first 12 weeks after launch.
+Distribution_Pct,Number,"Percentage of target retail outlets stocking the product by week 12, 0 to 100."
+Sales_vs_Target_Pct,Number,"First 12 weeks sales divided by the target agreed before launch, multiplied by 100. 100 means target met."
+Repeat_Purchase_Pct,Number,"Percentage of tracked initial buyers purchasing again within 12 weeks, 0 to 100."
