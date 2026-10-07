@@ -17,8 +17,9 @@ genuinely missing values while leaving the ``"NA"`` markers intact.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -254,10 +255,10 @@ def load_data_dictionary(path: str | Path | None = None) -> pd.DataFrame:
 
 
 __all__ = [
-    "DATA_DIR",
-    "PROJECT_ROOT",
-    "NA_MARKER",
     "CONDITIONAL_COLUMNS",
+    "DATA_DIR",
+    "NA_MARKER",
+    "PROJECT_ROOT",
     "clean_historical_data",
     "drop_missing_rows",
     "get_data_path",

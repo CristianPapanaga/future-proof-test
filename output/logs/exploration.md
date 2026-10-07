@@ -1,5 +1,5 @@
 # Exploratory Data Analysis — Historical Concept Tests
-*Generated 2026-10-07 00:24:30*
+*Generated 2026-10-07 12:09:24*
 
 ## 1. Dataset overview
 The cleaned historical dataset contains one row per concept test. Currency columns were parsed to floats and categorical columns to category dtype (see ``data_utilities.py``).
@@ -56,6 +56,33 @@ Categorical variables are summarised as frequency tables (count and percentage o
 | Yes | 403 | 53.7 |
 | No | 347 | 46.3 |
 
+### Research package by year
+The research-package mix is tabulated against ``Test_Year`` to show how the design of concept tests has shifted over time.
+
+| Test_Year | Survey | Behavioural | Combined |
+| --- | --- | --- | --- |
+| 2022 | 97 | 46 | 21 |
+| 2023 | 104 | 79 | 31 |
+| 2024 | 51 | 68 | 72 |
+| 2025 | 38 | 81 | 62 |
+
+| Test_Year | Survey | Behavioural | Combined |
+| --- | --- | --- | --- |
+| 2022 | 59.1 | 28.0 | 12.8 |
+| 2023 | 48.6 | 36.9 | 14.5 |
+| 2024 | 26.7 | 35.6 | 37.7 |
+| 2025 | 21.0 | 44.8 | 34.3 |
+
+| Research package | 2022 (%) | 2025 (%) | Change (pp) |
+| --- | --- | --- | --- |
+| Survey | 59.1 | 21.0 | -38.2 |
+| Behavioural | 28.0 | 44.8 | 16.7 |
+| Combined | 12.8 | 34.3 | 21.4 |
+
+Between 2022 and 2025 the mix shifted decisively away from Survey-only research and toward the richer Behavioural and Combined packages. Survey fell from 59.1% to 21.0% (-38.2 pp), while Behavioural rose from 28.0% to 44.8% (+16.7 pp) and Combined rose from 12.8% to 34.3% (+21.4 pp).
+
+A chi-square test of independence (year × package) gives χ² = 89.60, df = 6, p = 3.67e-17, so the change across years is statistically significant.
+
 ## 3. Numeric summary statistics
 Each numeric column is summarised with its non-missing count, mean, standard deviation, minimum, quartiles (25/50/75) and maximum, plus the number of missing values. Mean and standard deviation summarise spread for roughly symmetric data, while the median and inter-quartile range are robust to the right-skew typical of cost variables. ``Research_Cost_EUR`` and ``Launch_Support_EUR`` are in euros.
 
@@ -72,6 +99,83 @@ Each numeric column is summarised with its non-missing count, mean, standard dev
 | Distribution_Pct | 384 | 59.23 | 17.28 | 14.3 | 46.6 | 58.8 | 70.9 | 98 | 366 |
 | Sales_vs_Target_Pct | 371 | 94.11 | 23.82 | 34.8 | 77.9 | 95.1 | 111 | 157 | 379 |
 | Repeat_Purchase_Pct | 358 | 26.41 | 9.09 | 1.8 | 20.65 | 26.3 | 32.28 | 51.2 | 392 |
+
+### Research cost and turnaround by package
+``Research_Cost_EUR`` and ``Turnaround_Days`` are tabulated as means by research package, with Survey treated as the baseline. The difference columns show the premium (or saving) of the Behavioural and Combined packages relative to Survey. Means are reported here; the full distribution per column is available in the summary above.
+
+| Research package | n | Mean cost (€) | Δ cost vs Survey (€) | Mean turnaround (days) | Δ turnaround vs Survey (days) |
+| --- | --- | --- | --- | --- | --- |
+| Survey | 290 | 8,767 | — | 12.1 | — |
+| Behavioural | 274 | 11,982 | +3,214 | 15.8 | +3.8 |
+| Combined | 186 | 15,094 | +6,326 | 19.5 | +7.5 |
+
+### Correlations
+Pearson correlations between all numeric columns are tabulated below (values rounded to 2dp). Each coefficient is computed on pairwise-complete observations, so pairs involving ``Implicit_Score`` (Combined packages only), ``Behavioural_Choice_Pct`` (Behavioural/Combined), or the launch metrics (launched concepts only) rest on smaller, more restricted subsamples and should be interpreted with that in mind.
+
+The matrix is split into two tables — research-phase columns and launch-phase columns — so it fits the page width. Each table still lists all eleven variables as rows.
+
+| Variable | Sample_Size | Turnaround_Days | Research_Cost_EUR | Stated_Appeal | Purchase_Intent | Behavioural_Choice_Pct | Implicit_Score |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Sample_Size | 1 | 0.26 | 0.4 | -0.01 | -0.01 | -0.03 | -0.01 |
+| Turnaround_Days | 0.26 | 1 | 0.81 | 0.03 | -0.01 | -0.03 | -0.02 |
+| Research_Cost_EUR | 0.4 | 0.81 | 1 | 0.02 | -0.03 | 0.03 | 0.02 |
+| Stated_Appeal | -0.01 | 0.03 | 0.02 | 1 | 0.49 | 0.38 | 0.3 |
+| Purchase_Intent | -0.01 | -0.01 | -0.03 | 0.49 | 1 | 0.45 | 0.4 |
+| Behavioural_Choice_Pct | -0.03 | -0.03 | 0.03 | 0.38 | 0.45 | 1 | 0.49 |
+| Implicit_Score | -0.01 | -0.02 | 0.02 | 0.3 | 0.4 | 0.49 | 1 |
+| Launch_Support_EUR | -0.09 | 0.37 | 0.37 | 0.06 | -0.04 | 0.11 | 0.05 |
+| Distribution_Pct | -0.04 | 0.35 | 0.36 | -0.02 | 0.02 | 0.09 | -0.14 |
+| Sales_vs_Target_Pct | -0.11 | 0.11 | 0.13 | 0.15 | 0.19 | 0.38 | 0.37 |
+| Repeat_Purchase_Pct | 0 | 0.05 | 0.05 | 0.23 | 0.31 | 0.48 | 0.47 |
+
+| Variable | Launch_Support_EUR | Distribution_Pct | Sales_vs_Target_Pct | Repeat_Purchase_Pct |
+| --- | --- | --- | --- | --- |
+| Sample_Size | -0.09 | -0.04 | -0.11 | 0 |
+| Turnaround_Days | 0.37 | 0.35 | 0.11 | 0.05 |
+| Research_Cost_EUR | 0.37 | 0.36 | 0.13 | 0.05 |
+| Stated_Appeal | 0.06 | -0.02 | 0.15 | 0.23 |
+| Purchase_Intent | -0.04 | 0.02 | 0.19 | 0.31 |
+| Behavioural_Choice_Pct | 0.11 | 0.09 | 0.38 | 0.48 |
+| Implicit_Score | 0.05 | -0.14 | 0.37 | 0.47 |
+| Launch_Support_EUR | 1 | 0.31 | 0.26 | 0.14 |
+| Distribution_Pct | 0.31 | 1 | 0.31 | 0.06 |
+| Sales_vs_Target_Pct | 0.26 | 0.31 | 1 | 0.25 |
+| Repeat_Purchase_Pct | 0.14 | 0.06 | 0.25 | 1 |
+
+### Research-phase ↔ launch-phase correlations
+The cross-phase correlations — between the pre-launch research metrics and the post-launch performance metrics — are shown below, restricted to pairs with |r| ≥ 0.20 and sorted by absolute value. Strength bands: |r| 0.20–0.29 weak, 0.30–0.49 moderate, ≥ 0.50 strong. These are the relationships most relevant to whether research metrics foreshadow launch outcomes.
+
+| Research variable | Launch variable | r | Strength |
+| --- | --- | --- | --- |
+| Behavioural_Choice_Pct | Repeat_Purchase_Pct | 0.48 | Moderate |
+| Implicit_Score | Repeat_Purchase_Pct | 0.47 | Moderate |
+| Behavioural_Choice_Pct | Sales_vs_Target_Pct | 0.38 | Moderate |
+| Turnaround_Days | Launch_Support_EUR | 0.37 | Moderate |
+| Research_Cost_EUR | Launch_Support_EUR | 0.37 | Moderate |
+| Implicit_Score | Sales_vs_Target_Pct | 0.37 | Moderate |
+| Research_Cost_EUR | Distribution_Pct | 0.36 | Moderate |
+| Turnaround_Days | Distribution_Pct | 0.35 | Moderate |
+| Purchase_Intent | Repeat_Purchase_Pct | 0.31 | Moderate |
+| Stated_Appeal | Repeat_Purchase_Pct | 0.23 | Weak |
+
+- The behavioural and implicit measures are the strongest pre-launch predictors of launch outcomes: ``Behavioural_Choice_Pct`` and ``Implicit_Score`` correlate with ``Repeat_Purchase_Pct`` (r = 0.48 and 0.47) and ``Sales_vs_Target_Pct`` (r = 0.38 and 0.37), more strongly than any stated-metric pairing.
+- ``Stated_Appeal`` now appears only once, and only weakly (r = 0.23 with ``Repeat_Purchase_Pct``), while ``Sample_Size`` is absent entirely: the attitudinal (stated) appeal and sample size still carry little predictive signal for launch outcomes.
+
+### Notable correlations
+The strongest pairwise correlations (by absolute value) are listed below, each classified as weak (0.20–0.29), moderate (0.30–0.49), or strong (≥ 0.50). Only one pair is strong: ``Turnaround_Days`` and ``Research_Cost_EUR`` (r = 0.81), reflecting that larger, more expensive studies take longer. The remainder are moderate (r ≈ 0.4–0.5): the research-phase metrics (``Stated_Appeal``, ``Purchase_Intent``, ``Behavioural_Choice_Pct``, ``Implicit_Score``) inter-correlate, and ``Repeat_Purchase_Pct`` tracks several of these, suggesting launch outcomes are partly foreshadowed by pre-launch consumer metrics.
+
+| Variable 1 | Variable 2 | r | Strength |
+| --- | --- | --- | --- |
+| Turnaround_Days | Research_Cost_EUR | 0.81 | Strong |
+| Stated_Appeal | Purchase_Intent | 0.49 | Moderate |
+| Behavioural_Choice_Pct | Implicit_Score | 0.49 | Moderate |
+| Behavioural_Choice_Pct | Repeat_Purchase_Pct | 0.48 | Moderate |
+| Implicit_Score | Repeat_Purchase_Pct | 0.47 | Moderate |
+| Purchase_Intent | Behavioural_Choice_Pct | 0.45 | Moderate |
+| Sample_Size | Research_Cost_EUR | 0.4 | Moderate |
+| Purchase_Intent | Implicit_Score | 0.4 | Moderate |
+| Stated_Appeal | Behavioural_Choice_Pct | 0.38 | Moderate |
+| Behavioural_Choice_Pct | Sales_vs_Target_Pct | 0.38 | Moderate |
 
 ## 4. Missing values
 During cleaning, values that are legitimately absent are marked with the string ``"NA"``, while genuinely missing values remain ``pd.NA``. *Absent by design* rows are therefore those marked ``"NA"`` (e.g. launch-phase metrics for unlaunched concepts), and *applicable but missing* rows are the ``pd.NA`` values (a genuine data-collection gap). ``% missing`` is the collection-failure rate among applicable rows.

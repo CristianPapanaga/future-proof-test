@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pandas as pd
 from pyampute.exploration.mcar_statistical_tests import MCARTest
+from scipy import stats
 
 import data_utilities
 import log_writer
@@ -46,6 +47,11 @@ NUMERIC_COLUMNS: list[str] = [
     "Repeat_Purchase_Pct",
 ]
 
+#: Numeric columns split by phase, used to render the correlation matrix as
+#: two narrower tables that fit the page width.
+RESEARCH_PHASE_COLUMNS: list[str] = NUMERIC_COLUMNS[:7]
+LAUNCH_PHASE_COLUMNS: list[str] = NUMERIC_COLUMNS[7:]
+
 #: Nominal categorical columns tabulated as frequencies (count + percentage).
 CATEGORICAL_COLUMNS: list[tuple[str, str]] = [
     ("Category", "Product category"),
@@ -53,6 +59,9 @@ CATEGORICAL_COLUMNS: list[tuple[str, str]] = [
     ("Research_Package", "Research package"),
     ("Recommendation", "Research recommendation"),
 ]
+
+#: Logical display order for the research-package categories.
+PACKAGE_ORDER: list[str] = ["Survey", "Behavioural", "Combined"]
 
 
 def _frequencies(
@@ -72,6 +81,136 @@ def _frequencies(
             "Count": counts.to_numpy(),
             "Pct (%)": (counts.to_numpy() / total * 100).round(1),
         }
+    )
+
+
+def _package_trend(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (counts, row-percentages) crosstab of Research_Package by year."""
+    counts = pd.crosstab(df["Test_Year"], df["Research_Package"]).reindex(
+        columns=PACKAGE_ORDER
+    )
+    pct = counts.div(counts.sum(axis=1), axis=0).mul(100)
+    return counts, pct
+
+
+def _package_cost_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Mean research cost and turnaround days by package, versus Survey baseline.
+
+    Survey is the baseline package; the difference columns show how much more
+    (positive) or less (negative) the Behavioural and Combined packages cost
+    and take relative to Survey. Cost is in euros, turnaround in days.
+    """
+    metrics = ["Research_Cost_EUR", "Turnaround_Days"]
+    grouped = (
+        df.groupby("Research_Package", observed=True)[metrics].mean().reindex(PACKAGE_ORDER)
+    )
+    counts = df["Research_Package"].value_counts().reindex(PACKAGE_ORDER)
+    base_cost = grouped.loc["Survey", "Research_Cost_EUR"]
+    base_days = grouped.loc["Survey", "Turnaround_Days"]
+
+    rows = []
+    for package in PACKAGE_ORDER:
+        cost = grouped.loc[package, "Research_Cost_EUR"]
+        days = grouped.loc[package, "Turnaround_Days"]
+        if package == "Survey":
+            d_cost = "—"
+            d_days = "—"
+        else:
+            d_cost = f"{cost - base_cost:+,.0f}"
+            d_days = f"{days - base_days:+.1f}"
+        rows.append(
+            {
+                "Research package": package,
+                "n": int(counts[package]),
+                "Mean cost (€)": f"{cost:,.0f}",
+                "Δ cost vs Survey (€)": d_cost,
+                "Mean turnaround (days)": f"{days:.1f}",
+                "Δ turnaround vs Survey (days)": d_days,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _correlation_matrix(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Pearson correlation matrix for the numeric columns.
+
+    Structural ``"NA"`` (absent by design) markers are coerced to NaN, so each
+    pair is computed on pairwise-complete observations — rows where both
+    variables are applicable. Pairs involving ``Implicit_Score`` (Combined
+    packages only), ``Behavioural_Choice_Pct`` (Behavioural/Combined), or the
+    launch metrics (launched concepts only) therefore rest on smaller,
+    more restricted subsamples.
+    """
+    numeric = pd.DataFrame(
+        {
+            column: pd.to_numeric(df[column], errors="coerce").astype("float64")
+            for column in columns
+        }
+    )
+    return numeric.corr(method="pearson").round(2)
+
+
+def _correlation_strength(r: float) -> str:
+    """Classify a correlation coefficient into a strength band.
+
+    Bands: |r| 0.20–0.29 weak, 0.30–0.49 moderate, ≥ 0.50 strong. Values below
+    0.20 are treated as negligible and excluded upstream.
+    """
+    r_abs = abs(r)
+    if r_abs >= 0.50:
+        return "Strong"
+    if r_abs >= 0.30:
+        return "Moderate"
+    return "Weak"
+
+
+def _top_correlations(corr: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
+    """Return the strongest pairwise correlations, excluding the diagonal."""
+    columns = list(corr.columns)
+    pairs = [
+        (columns[i], columns[j], corr.iloc[i, j])
+        for i in range(len(columns))
+        for j in range(i + 1, len(columns))
+    ]
+    pairs.sort(key=lambda item: abs(item[2]), reverse=True)
+    return pd.DataFrame(
+        [
+            {
+                "Variable 1": a,
+                "Variable 2": b,
+                "r": r,
+                "Strength": _correlation_strength(r),
+            }
+            for a, b, r in pairs[:limit]
+        ]
+    )
+
+
+def _cross_phase_correlations(corr: pd.DataFrame, threshold: float = 0.2) -> pd.DataFrame:
+    """Return research-phase × launch-phase pairs with |r| >= threshold.
+
+    These are the "cross-block" correlations between the pre-launch research
+    metrics and the post-launch performance metrics, restricted to notable
+    (weak-or-stronger) coefficients and sorted by absolute value. Each pair is
+    classified into a strength band (weak / moderate / strong).
+    """
+    pairs = [
+        (research, launch, corr.loc[research, launch])
+        for research in RESEARCH_PHASE_COLUMNS
+        for launch in LAUNCH_PHASE_COLUMNS
+        if abs(corr.loc[research, launch]) >= threshold
+    ]
+    pairs.sort(key=lambda item: abs(item[2]), reverse=True)
+    return pd.DataFrame(
+        [
+            {
+                "Research variable": research,
+                "Launch variable": launch,
+                "r": r,
+                "Strength": _correlation_strength(r),
+            }
+            for research, launch, r in pairs
+        ]
     )
 
 
@@ -289,6 +428,47 @@ def main() -> None:
             )
         )
 
+        log.heading("Research package by year", level=3)
+        package_counts, package_pct = _package_trend(df)
+        log.paragraph(
+            "The research-package mix is tabulated against ``Test_Year`` to "
+            "show how the design of concept tests has shifted over time."
+        )
+        log.table(package_counts.reset_index())
+        log.table(package_pct.reset_index(), float_format="{:.1f}".format)
+
+        pct_2022 = package_pct.loc[2022]
+        pct_2025 = package_pct.loc[2025]
+        package_change = pct_2025 - pct_2022
+        log.table(
+            pd.DataFrame(
+                {
+                    "Research package": PACKAGE_ORDER,
+                    "2022 (%)": [pct_2022[p] for p in PACKAGE_ORDER],
+                    "2025 (%)": [pct_2025[p] for p in PACKAGE_ORDER],
+                    "Change (pp)": [package_change[p] for p in PACKAGE_ORDER],
+                }
+            ),
+            float_format="{:.1f}".format,
+        )
+        log.paragraph(
+            "Between 2022 and 2025 the mix shifted decisively away from "
+            "Survey-only research and toward the richer Behavioural and "
+            "Combined packages. Survey fell from "
+            f"{pct_2022['Survey']:.1f}% to {pct_2025['Survey']:.1f}% "
+            f"({package_change['Survey']:+.1f} pp), while Behavioural rose from "
+            f"{pct_2022['Behavioural']:.1f}% to {pct_2025['Behavioural']:.1f}% "
+            f"({package_change['Behavioural']:+.1f} pp) and Combined rose from "
+            f"{pct_2022['Combined']:.1f}% to {pct_2025['Combined']:.1f}% "
+            f"({package_change['Combined']:+.1f} pp)."
+        )
+        package_chi2, package_p, package_dof, _ = stats.chi2_contingency(package_counts)
+        log.paragraph(
+            f"A chi-square test of independence (year × package) gives χ² = "
+            f"{package_chi2:.2f}, df = {int(package_dof)}, p = {package_p:.3g}, "
+            "so the change across years is statistically significant."
+        )
+
         # 3. Numeric summary ------------------------------------------------
         log.heading("3. Numeric summary statistics", level=2)
         log.paragraph(
@@ -301,6 +481,83 @@ def main() -> None:
             "``Launch_Support_EUR`` are in euros."
         )
         log.table(_numeric_summary(df, NUMERIC_COLUMNS))
+
+        log.heading("Research cost and turnaround by package", level=3)
+        log.paragraph(
+            "``Research_Cost_EUR`` and ``Turnaround_Days`` are tabulated as "
+            "means by research package, with Survey treated as the baseline. "
+            "The difference columns show the premium (or saving) of the "
+            "Behavioural and Combined packages relative to Survey. Means are "
+            "reported here; the full distribution per column is available in "
+            "the summary above."
+        )
+        log.table(_package_cost_summary(df))
+
+        log.heading("Correlations", level=3)
+        log.paragraph(
+            "Pearson correlations between all numeric columns are tabulated "
+            "below (values rounded to 2dp). Each coefficient is computed on "
+            "pairwise-complete observations, so pairs involving "
+            "``Implicit_Score`` (Combined packages only), "
+            "``Behavioural_Choice_Pct`` (Behavioural/Combined), or the launch "
+            "metrics (launched concepts only) rest on smaller, more restricted "
+            "subsamples and should be interpreted with that in mind."
+        )
+        corr = _correlation_matrix(df, NUMERIC_COLUMNS)
+
+        log.paragraph(
+            "The matrix is split into two tables — research-phase columns and "
+            "launch-phase columns — so it fits the page width. Each table "
+            "still lists all eleven variables as rows."
+        )
+        corr_research = corr[RESEARCH_PHASE_COLUMNS].copy()
+        corr_research.insert(0, "Variable", corr_research.index)
+        log.table(corr_research)
+
+        corr_launch = corr[LAUNCH_PHASE_COLUMNS].copy()
+        corr_launch.insert(0, "Variable", corr_launch.index)
+        log.table(corr_launch)
+
+        log.heading("Research-phase ↔ launch-phase correlations", level=3)
+        log.paragraph(
+            "The cross-phase correlations — between the pre-launch research "
+            "metrics and the post-launch performance metrics — are shown "
+            "below, restricted to pairs with |r| ≥ 0.20 and sorted by "
+            "absolute value. Strength bands: |r| 0.20–0.29 weak, 0.30–0.49 "
+            "moderate, ≥ 0.50 strong. These are the relationships most "
+            "relevant to whether research metrics foreshadow launch outcomes."
+        )
+        log.table(_cross_phase_correlations(corr))
+        log.bullets(
+            [
+                "The behavioural and implicit measures are the strongest "
+                "pre-launch predictors of launch outcomes: "
+                "``Behavioural_Choice_Pct`` and ``Implicit_Score`` correlate "
+                "with ``Repeat_Purchase_Pct`` (r = 0.48 and 0.47) and "
+                "``Sales_vs_Target_Pct`` (r = 0.38 and 0.37), more strongly "
+                "than any stated-metric pairing.",
+                "``Stated_Appeal`` now appears only once, and only weakly "
+                "(r = 0.23 with ``Repeat_Purchase_Pct``), while "
+                "``Sample_Size`` is absent entirely: the attitudinal (stated) "
+                "appeal and sample size still carry little predictive signal "
+                "for launch outcomes.",
+            ]
+        )
+
+        log.heading("Notable correlations", level=3)
+        log.paragraph(
+            "The strongest pairwise correlations (by absolute value) are listed "
+            "below, each classified as weak (0.20–0.29), moderate (0.30–0.49), "
+            "or strong (≥ 0.50). Only one pair is strong: ``Turnaround_Days`` "
+            "and ``Research_Cost_EUR`` (r = 0.81), reflecting that larger, more "
+            "expensive studies take longer. The remainder are moderate "
+            "(r ≈ 0.4–0.5): the research-phase metrics (``Stated_Appeal``, "
+            "``Purchase_Intent``, ``Behavioural_Choice_Pct``, "
+            "``Implicit_Score``) inter-correlate, and ``Repeat_Purchase_Pct`` "
+            "tracks several of these, suggesting launch outcomes are partly "
+            "foreshadowed by pre-launch consumer metrics."
+        )
+        log.table(_top_correlations(corr))
 
         # 4. Missing values -------------------------------------------------
         log.heading("4. Missing values", level=2)
