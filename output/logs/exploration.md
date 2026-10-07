@@ -1,5 +1,5 @@
 # Exploratory Data Analysis — Historical Concept Tests
-*Generated 2026-10-07 12:09:24*
+*Generated 2026-10-07 12:52:19*
 
 ## 1. Dataset overview
 The cleaned historical dataset contains one row per concept test. Currency columns were parsed to floats and categorical columns to category dtype (see ``data_utilities.py``).
@@ -158,8 +158,7 @@ The cross-phase correlations — between the pre-launch research metrics and the
 | Purchase_Intent | Repeat_Purchase_Pct | 0.31 | Moderate |
 | Stated_Appeal | Repeat_Purchase_Pct | 0.23 | Weak |
 
-- The behavioural and implicit measures are the strongest pre-launch predictors of launch outcomes: ``Behavioural_Choice_Pct`` and ``Implicit_Score`` correlate with ``Repeat_Purchase_Pct`` (r = 0.48 and 0.47) and ``Sales_vs_Target_Pct`` (r = 0.38 and 0.37), more strongly than any stated-metric pairing.
-- ``Stated_Appeal`` now appears only once, and only weakly (r = 0.23 with ``Repeat_Purchase_Pct``), while ``Sample_Size`` is absent entirely: the attitudinal (stated) appeal and sample size still carry little predictive signal for launch outcomes.
+The behavioural and implicit measures are the strongest pre-launch predictors of launch outcomes: ``Behavioural_Choice_Pct`` and ``Implicit_Score`` correlate with ``Repeat_Purchase_Pct`` (r = 0.48 and 0.47) and ``Sales_vs_Target_Pct`` (r = 0.38 and 0.37), more strongly than any stated-metric pairing. ``Stated_Appeal`` appears only once, and only weakly (r = 0.23 with ``Repeat_Purchase_Pct``), while ``Sample_Size`` is absent entirely — the attitudinal (stated) appeal and sample size carry little predictive signal for launch outcomes.
 
 ### Notable correlations
 The strongest pairwise correlations (by absolute value) are listed below, each classified as weak (0.20–0.29), moderate (0.30–0.49), or strong (≥ 0.50). Only one pair is strong: ``Turnaround_Days`` and ``Research_Cost_EUR`` (r = 0.81), reflecting that larger, more expensive studies take longer. The remainder are moderate (r ≈ 0.4–0.5): the research-phase metrics (``Stated_Appeal``, ``Purchase_Intent``, ``Behavioural_Choice_Pct``, ``Implicit_Score``) inter-correlate, and ``Repeat_Purchase_Pct`` tracks several of these, suggesting launch outcomes are partly foreshadowed by pre-launch consumer metrics.

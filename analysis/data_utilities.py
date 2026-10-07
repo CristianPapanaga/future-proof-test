@@ -98,6 +98,22 @@ def _not_applicable(df: pd.DataFrame, column: str) -> pd.Series:
     return pd.Series(False, index=df.index)
 
 
+def correlation_strength(r: float) -> str:
+    """Classify a correlation coefficient into a strength band.
+
+    Bands: |r| < 0.20 negligible, 0.20–0.29 weak, 0.30–0.49 moderate, ≥ 0.50
+    strong.
+    """
+    r_abs = abs(r)
+    if r_abs >= 0.50:
+        return "Strong"
+    if r_abs >= 0.30:
+        return "Moderate"
+    if r_abs >= 0.20:
+        return "Weak"
+    return "Negligible"
+
+
 def get_data_path(filename: str) -> Path:
     """Return the absolute path to ``filename`` inside the ``data/`` directory."""
     return DATA_DIR / filename
@@ -260,6 +276,7 @@ __all__ = [
     "NA_MARKER",
     "PROJECT_ROOT",
     "clean_historical_data",
+    "correlation_strength",
     "drop_missing_rows",
     "get_data_path",
     "load_data_dictionary",

@@ -150,20 +150,6 @@ def _correlation_matrix(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return numeric.corr(method="pearson").round(2)
 
 
-def _correlation_strength(r: float) -> str:
-    """Classify a correlation coefficient into a strength band.
-
-    Bands: |r| 0.20–0.29 weak, 0.30–0.49 moderate, ≥ 0.50 strong. Values below
-    0.20 are treated as negligible and excluded upstream.
-    """
-    r_abs = abs(r)
-    if r_abs >= 0.50:
-        return "Strong"
-    if r_abs >= 0.30:
-        return "Moderate"
-    return "Weak"
-
-
 def _top_correlations(corr: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
     """Return the strongest pairwise correlations, excluding the diagonal."""
     columns = list(corr.columns)
@@ -179,7 +165,7 @@ def _top_correlations(corr: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
                 "Variable 1": a,
                 "Variable 2": b,
                 "r": r,
-                "Strength": _correlation_strength(r),
+                "Strength": data_utilities.correlation_strength(r),
             }
             for a, b, r in pairs[:limit]
         ]
@@ -207,7 +193,7 @@ def _cross_phase_correlations(corr: pd.DataFrame, threshold: float = 0.2) -> pd.
                 "Research variable": research,
                 "Launch variable": launch,
                 "r": r,
-                "Strength": _correlation_strength(r),
+                "Strength": data_utilities.correlation_strength(r),
             }
             for research, launch, r in pairs
         ]
@@ -528,20 +514,17 @@ def main() -> None:
             "relevant to whether research metrics foreshadow launch outcomes."
         )
         log.table(_cross_phase_correlations(corr))
-        log.bullets(
-            [
-                "The behavioural and implicit measures are the strongest "
-                "pre-launch predictors of launch outcomes: "
-                "``Behavioural_Choice_Pct`` and ``Implicit_Score`` correlate "
-                "with ``Repeat_Purchase_Pct`` (r = 0.48 and 0.47) and "
-                "``Sales_vs_Target_Pct`` (r = 0.38 and 0.37), more strongly "
-                "than any stated-metric pairing.",
-                "``Stated_Appeal`` now appears only once, and only weakly "
-                "(r = 0.23 with ``Repeat_Purchase_Pct``), while "
-                "``Sample_Size`` is absent entirely: the attitudinal (stated) "
-                "appeal and sample size still carry little predictive signal "
-                "for launch outcomes.",
-            ]
+        log.paragraph(
+            "The behavioural and implicit measures are the strongest "
+            "pre-launch predictors of launch outcomes: "
+            "``Behavioural_Choice_Pct`` and ``Implicit_Score`` correlate "
+            "with ``Repeat_Purchase_Pct`` (r = 0.48 and 0.47) and "
+            "``Sales_vs_Target_Pct`` (r = 0.38 and 0.37), more strongly "
+            "than any stated-metric pairing. ``Stated_Appeal`` appears only "
+            "once, and only weakly (r = 0.23 with ``Repeat_Purchase_Pct``), "
+            "while ``Sample_Size`` is absent entirely — the attitudinal "
+            "(stated) appeal and sample size carry little predictive signal "
+            "for launch outcomes."
         )
 
         log.heading("Notable correlations", level=3)
