@@ -198,6 +198,72 @@ class MarkdownLog:
         rows = [list(pair) for pair in items]
         self.table(rows, headers=["Key", "Value"], float_format=float_format, na_rep=na_rep)
 
+    def table_pair(
+        self,
+        left: Any,
+        right: Any,
+        left_headers: Sequence[Any] | None = None,
+        right_headers: Sequence[Any] | None = None,
+        *,
+        float_format: Any = None,
+        na_rep: str = "",
+    ) -> None:
+        """Render two tables side by side, separated by an empty column.
+
+        ``left`` and ``right`` may be any form accepted by :meth:`table` (a
+        DataFrame, a columnar dict, or an iterable of rows). The shorter table
+        is padded with empty cells so its rows align with the longer one.
+        """
+        left_rows, left_headers = _coerce_table(left, left_headers)
+        right_rows, right_headers = _coerce_table(right, right_headers)
+
+        width_left = len(left_headers) if left_headers else 0
+        width_right = len(right_headers) if right_headers else 0
+        for row in left_rows:
+            width_left = max(width_left, len(row))
+        for row in right_rows:
+            width_right = max(width_right, len(row))
+        if width_left == 0 and width_right == 0:
+            return
+
+        left_headers = list(left_headers or [])
+        right_headers = list(right_headers or [])
+        left_headers += [""] * (width_left - len(left_headers))
+        right_headers += [""] * (width_right - len(right_headers))
+
+        n_rows = max(len(left_rows), len(right_rows))
+
+        def padded(rows: list[tuple], width: int) -> list[list]:
+            out = [list(row) + [""] * (width - len(row)) for row in rows]
+            out += [[""] * width] * (n_rows - len(out))
+            return out
+
+        left_rows = padded(left_rows, width_left)
+        right_rows = padded(right_rows, width_right)
+
+        def fmt(value: Any) -> str:
+            return _format_cell(value, float_format, na_rep)
+
+        total_width = width_left + 1 + width_right
+        lines = [
+            "| "
+            + " | ".join(fmt(c) for c in left_headers + [""] + right_headers)
+            + " |",
+            "| " + " | ".join("---" for _ in range(total_width)) + " |",
+        ]
+        for lrow, rrow in zip(left_rows, right_rows):
+            lines.append(
+                "| " + " | ".join(fmt(c) for c in lrow + [""] + rrow) + " |"
+            )
+
+        self.write("\n".join(lines))
+        self.blank()
+
+    def image(self, alt: str, path: str | Path) -> None:
+        """Embed an image using Markdown syntax (``![alt](path)``)."""
+        self.write(f"![{alt}]({path})")
+        self.blank()
+
     def header(self, title: str, level: int = 1) -> None:
         """Write a titled section header plus a generation timestamp."""
         self.heading(title, level)
