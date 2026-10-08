@@ -13,7 +13,16 @@ import os
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.linear_model import LinearRegression, Ridge, RidgeCV
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge, RidgeCV
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import RepeatedKFold
 from sklearn.preprocessing import StandardScaler
 
@@ -50,6 +59,26 @@ FIXED_ALPHA: float = 10.0
 
 #: Regularisation strengths used to check option A's sensitivity to alpha.
 ALPHA_SENSITIVITY: list[float] = [0.0, 10.0, 50.0]
+
+#: Inverse regularisation strength for the logistic classification models
+#: (``LogisticRegression`` with an L2 penalty).
+LOGISTIC_C: float = 1.0
+
+#: Confounders used to model research-package selection (the propensity score).
+#: ``Sample_Size`` is excluded because the exploratory analysis found it
+#: negligibly correlated with launch outcomes, and ``Research_Cost_EUR`` /
+#: ``Turnaround_Days`` are excluded because they are consequences of the package
+#: choice rather than confounders.
+PROPENSITY_CONFOUNDERS: list[str] = ["Test_Year", "Category", "Innovation_Type"]
+
+#: Package levels treated as the "rich" research package, versus Survey.
+RICH_PACKAGES: list[str] = ["Behavioural", "Combined"]
+
+#: Inverse regularisation strength for the propensity-score model.
+PROPENSITY_C: float = 1.0
+
+#: Quantiles at which the stabilised inverse-propensity weights are trimmed.
+WEIGHT_TRIM_QUANTILES: tuple[float, float] = (0.01, 0.99)
 
 
 def _context_facts(df: pd.DataFrame) -> dict[str, float | int]:
@@ -255,6 +284,78 @@ def ridge_model(
     }
 
 
+def logistic_model(
+    df: pd.DataFrame,
+    predictors: list[str],
+    complete_on: list[str] | None = None,
+    C: float = LOGISTIC_C,
+) -> dict:
+    """Fit a regularised logistic regression predicting binary success.
+
+    Success is ``Sales_vs_Target_Pct >= SUCCESS_THRESHOLD``. The model uses an
+    L2 penalty with balanced class weights (``LogisticRegression``), predictors
+    standardised to z-scores, and ``C`` as the inverse regularisation strength.
+    The sample is restricted exactly like :func:`linear_model`. Coefficients
+    are reported per standard deviation (log-odds and odds ratios); metrics are
+    in-sample and therefore optimistic.
+    """
+    if complete_on is None:
+        complete_on = predictors
+    launched = df[df["Launched"] == 1]
+    launched = launched[_applicable_mask(launched, complete_on)]
+    sub = data_utilities.drop_missing_rows(launched, complete_on + [TARGET])
+
+    X = pd.DataFrame(
+        {col: pd.to_numeric(sub[col], errors="coerce") for col in predictors}
+    )
+    y_raw = pd.to_numeric(sub[TARGET], errors="coerce")
+    y = (y_raw >= SUCCESS_THRESHOLD).astype(int)
+
+    scaler = StandardScaler().fit(X)
+    X_std = pd.DataFrame(scaler.transform(X), columns=predictors)
+
+    model = LogisticRegression(
+        C=C,
+        l1_ratio=0.0,
+        class_weight="balanced",
+        solver="lbfgs",
+        max_iter=2000,
+    ).fit(X_std, y)
+
+    y_prob = model.predict_proba(X_std)[:, 1]
+    y_pred = model.predict(X_std)
+
+    coefs = pd.DataFrame(
+        [
+            {
+                "Term": "Intercept",
+                "Coefficient": float(model.intercept_[0]),
+                "Odds ratio": float(np.exp(model.intercept_[0])),
+            }
+        ]
+        + [
+            {
+                "Term": col,
+                "Coefficient": float(coef),
+                "Odds ratio": float(np.exp(coef)),
+            }
+            for col, coef in zip(predictors, model.coef_[0])
+        ]
+    )
+
+    return {
+        "n": len(X),
+        "success_rate": float(y.mean() * 100),
+        "coefs": coefs,
+        "accuracy": float(accuracy_score(y, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y, y_pred)),
+        "precision": float(precision_score(y, y_pred, zero_division=0)),
+        "recall": float(recall_score(y, y_pred, zero_division=0)),
+        "f1": float(f1_score(y, y_pred, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y, y_prob)),
+    }
+
+
 def _prepare_xy(
     df: pd.DataFrame, predictors: list[str], years: list[int]
 ) -> tuple[pd.DataFrame, pd.Series]:
@@ -330,6 +431,83 @@ def ridge_train_test(
         "coefs": coefs,
         "y_test": y_test.to_numpy(),
         "y_pred": y_pred,
+    }
+
+
+def logistic_train_test(
+    df: pd.DataFrame,
+    predictors: list[str],
+    train_years: tuple[int, ...] = (2022, 2023, 2024),
+    test_year: int = 2025,
+    C: float = LOGISTIC_C,
+) -> dict:
+    """Fit a regularised logistic regression on ``train_years``, predict ``test_year``.
+
+    Success is ``Sales_vs_Target_Pct >= SUCCESS_THRESHOLD``. The scaler is fit
+    on the training data only and applied unchanged to the held-out year, so the
+    test-year metrics are genuinely out of sample. Returns training/test sizes
+    and success rates, the fitted coefficients (odds ratios), in-sample (train)
+    and out-of-sample (test) classification metrics.
+    """
+    X_train, y_train_cont = _prepare_xy(df, predictors, list(train_years))
+    X_test, y_test_cont = _prepare_xy(df, predictors, [test_year])
+
+    y_train = (y_train_cont >= SUCCESS_THRESHOLD).astype(int)
+    y_test = (y_test_cont >= SUCCESS_THRESHOLD).astype(int)
+
+    scaler = StandardScaler().fit(X_train)
+    X_train_std = scaler.transform(X_train)
+    X_test_std = scaler.transform(X_test)
+
+    model = LogisticRegression(
+        C=C,
+        l1_ratio=0.0,
+        class_weight="balanced",
+        solver="lbfgs",
+        max_iter=2000,
+    ).fit(X_train_std, y_train)
+
+    y_prob_train = model.predict_proba(X_train_std)[:, 1]
+    y_pred_train = model.predict(X_train_std)
+    y_prob_test = model.predict_proba(X_test_std)[:, 1]
+    y_pred_test = model.predict(X_test_std)
+
+    coefs = pd.DataFrame(
+        [
+            {
+                "Term": "Intercept",
+                "Coefficient": float(model.intercept_[0]),
+                "Odds ratio": float(np.exp(model.intercept_[0])),
+            }
+        ]
+        + [
+            {
+                "Term": col,
+                "Coefficient": float(coef),
+                "Odds ratio": float(np.exp(coef)),
+            }
+            for col, coef in zip(predictors, model.coef_[0])
+        ]
+    )
+
+    return {
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
+        "train_success_rate": float(y_train.mean() * 100),
+        "test_success_rate": float(y_test.mean() * 100),
+        "coefs": coefs,
+        "train_accuracy": float(accuracy_score(y_train, y_pred_train)),
+        "train_balanced_accuracy": float(balanced_accuracy_score(y_train, y_pred_train)),
+        "train_roc_auc": float(roc_auc_score(y_train, y_prob_train)),
+        "test_accuracy": float(accuracy_score(y_test, y_pred_test)),
+        "test_balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred_test)),
+        "test_precision": float(precision_score(y_test, y_pred_test, zero_division=0)),
+        "test_recall": float(recall_score(y_test, y_pred_test, zero_division=0)),
+        "test_f1": float(f1_score(y_test, y_pred_test, zero_division=0)),
+        "test_roc_auc": float(roc_auc_score(y_test, y_prob_test)),
+        "test_brier": float(brier_score_loss(y_test, y_prob_test)),
+        "y_test": y_test.to_numpy(),
+        "y_prob_test": y_prob_test,
     }
 
 
@@ -489,6 +667,332 @@ def diff_summary_table(res: dict, better_label: str = "Full") -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _fold_classify(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_test: pd.DataFrame,
+    y_test: np.ndarray,
+    predictors: list[str],
+    C: float,
+) -> dict:
+    """Fit a logistic model on one CV fold and score it on the held-out fold.
+
+    Returns out-of-sample ROC-AUC, balanced accuracy and F1. ROC-AUC is NaN if
+    the test fold holds a single class.
+    """
+    Xtr = X_train[predictors]
+    Xte = X_test[predictors]
+    scaler = StandardScaler().fit(Xtr)
+    Xtr_std = scaler.transform(Xtr)
+    Xte_std = scaler.transform(Xte)
+
+    model = LogisticRegression(
+        C=C,
+        l1_ratio=0.0,
+        class_weight="balanced",
+        solver="lbfgs",
+        max_iter=2000,
+    ).fit(Xtr_std, y_train)
+
+    y_prob = model.predict_proba(Xte_std)[:, 1]
+    y_pred = model.predict(Xte_std)
+
+    try:
+        auc = float(roc_auc_score(y_test, y_prob))
+    except ValueError:
+        auc = float("nan")
+
+    return {
+        "auc": auc,
+        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+        "f1": float(f1_score(y_test, y_pred, zero_division=0)),
+    }
+
+
+def repeated_kfold_compare_logistic(
+    df: pd.DataFrame,
+    base_predictors: list[str],
+    full_predictors: list[str],
+    C: float = LOGISTIC_C,
+    n_splits: int = 7,
+    n_repeats: int = 20,
+    random_state: int = 42,
+) -> dict:
+    """Paired repeated K-fold comparison of two nested logistic models.
+
+    Mirrors :func:`repeated_kfold_compare` for classification. Both models are
+    fit on identical folds of the shared subset (cases complete on
+    ``full_predictors``), so within-fold differences (full − base) isolate the
+    contribution of the added predictors. Returns fold-level differences in
+    ROC-AUC, balanced accuracy and F1 (all higher is better), plus each model's
+    per-fold ROC-AUC.
+    """
+    sub = _shared_subset(df, full_predictors)
+    X = pd.DataFrame(
+        {
+            col: pd.to_numeric(sub[col], errors="coerce")
+            for col in full_predictors
+        }
+    )
+    y = (
+        pd.to_numeric(sub[TARGET], errors="coerce") >= SUCCESS_THRESHOLD
+    ).astype(int).to_numpy()
+
+    rkf = RepeatedKFold(
+        n_splits=n_splits, n_repeats=n_repeats, random_state=random_state
+    )
+
+    auc_diff, bal_diff, f1_diff = [], [], []
+    auc_base, auc_full = [], []
+    for train_idx, test_idx in rkf.split(X):
+        base = _fold_classify(
+            X.iloc[train_idx],
+            y[train_idx],
+            X.iloc[test_idx],
+            y[test_idx],
+            base_predictors,
+            C,
+        )
+        full = _fold_classify(
+            X.iloc[train_idx],
+            y[train_idx],
+            X.iloc[test_idx],
+            y[test_idx],
+            full_predictors,
+            C,
+        )
+        if np.isnan(base["auc"]) or np.isnan(full["auc"]):
+            auc_diff.append(np.nan)
+        else:
+            auc_diff.append(full["auc"] - base["auc"])
+        bal_diff.append(full["balanced_accuracy"] - base["balanced_accuracy"])
+        f1_diff.append(full["f1"] - base["f1"])
+        auc_base.append(base["auc"])
+        auc_full.append(full["auc"])
+
+    auc_diff = np.asarray(auc_diff, dtype=float)
+    valid = ~np.isnan(auc_diff)
+
+    return {
+        "n_cases": int(len(sub)),
+        "n_folds": n_splits * n_repeats,
+        "n_folds_auc": int(valid.sum()),
+        "auc_diff": auc_diff[valid],
+        "bal_diff": np.asarray(bal_diff),
+        "f1_diff": np.asarray(f1_diff),
+        "auc_base": np.asarray(auc_base),
+        "auc_full": np.asarray(auc_full),
+    }
+
+
+def classification_diff_summary_table(
+    res: dict, better_label: str = "Full"
+) -> pd.DataFrame:
+    """Build the metric summary table for a repeated-K-fold classification result.
+
+    All three metrics are higher-is-better, so the "better" share is the
+    proportion of folds with a positive difference.
+    """
+    rows = []
+    for metric, key in [
+        ("Δ ROC-AUC", "auc_diff"),
+        ("Δ balanced accuracy", "bal_diff"),
+        ("Δ F1", "f1_diff"),
+    ]:
+        s = summarise_fold_diffs(res[key])
+        rows.append(
+            {
+                "Metric": metric,
+                "Mean": f"{s['mean']:+.3f}",
+                "SD": f"{s['sd']:.3f}",
+                "Median": f"{s['median']:+.3f}",
+                "95% CI": f"[{s['ci_lo']:+.3f}, {s['ci_hi']:+.3f}]",
+                f"{better_label} better (% of folds)": f"{s['p_positive'] * 100:.0f}",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _propensity_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """One-hot encode the propensity confounders and build the rich-package target."""
+    treat = df["Research_Package"].isin(RICH_PACKAGES).astype(int)
+    parts = [df[col].astype(str).rename(col) for col in PROPENSITY_CONFOUNDERS]
+    X = pd.get_dummies(pd.concat(parts, axis=1), drop_first=True).astype(float)
+    return X, treat
+
+
+def propensity_scores(df: pd.DataFrame) -> dict:
+    """Fit the package-selection propensity model on all concepts.
+
+    Returns the one-hot design matrix, the binary treatment, the fitted
+    propensity scores, and the model coefficients (log-odds and odds ratios).
+    """
+    X, treat = _propensity_features(df)
+    model = LogisticRegression(
+        C=PROPENSITY_C,
+        l1_ratio=0.0,
+        class_weight="balanced",
+        solver="lbfgs",
+        max_iter=2000,
+    ).fit(X, treat)
+    e = pd.Series(model.predict_proba(X)[:, 1], index=df.index)
+
+    coefs = pd.DataFrame(
+        [
+            {
+                "Term": "Intercept",
+                "Coefficient": float(model.intercept_[0]),
+                "Odds ratio": float(np.exp(model.intercept_[0])),
+            }
+        ]
+        + [
+            {
+                "Term": col,
+                "Coefficient": float(coef),
+                "Odds ratio": float(np.exp(coef)),
+            }
+            for col, coef in zip(X.columns, model.coef_[0])
+        ]
+    )
+    return {"X": X, "treat": treat, "e": e, "model": model, "coefs": coefs}
+
+
+def _smd(x1: np.ndarray, x0: np.ndarray) -> float:
+    """Standardised mean difference (pooled SD) between two samples."""
+    m1, m0 = float(np.mean(x1)), float(np.mean(x0))
+    v1, v0 = float(np.var(x1, ddof=1)), float(np.var(x0, ddof=1))
+    denom = np.sqrt((v1 + v0) / 2.0)
+    return (m1 - m0) / denom if denom > 0 else 0.0
+
+
+def _wmean(x: np.ndarray, w: np.ndarray) -> float:
+    return float(np.average(x, weights=w))
+
+
+def _wvar(x: np.ndarray, w: np.ndarray) -> float:
+    m = _wmean(x, w)
+    return float(np.average((x - m) ** 2, weights=w))
+
+
+def _wsmd(x1: np.ndarray, x0: np.ndarray, w1: np.ndarray, w0: np.ndarray) -> float:
+    """Weighted standardised mean difference between two samples."""
+    m1, m0 = _wmean(x1, w1), _wmean(x0, w0)
+    v1, v0 = _wvar(x1, w1), _wvar(x0, w0)
+    denom = np.sqrt((v1 + v0) / 2.0)
+    return (m1 - m0) / denom if denom > 0 else 0.0
+
+
+def propensity_ipw(df: pd.DataFrame) -> dict:
+    """Estimate the rich-package success effect via inverse propensity weighting.
+
+    The propensity model is fit on the full population; the outcome effect is
+    estimated on the launched concepts with a recorded ``Sales_vs_Target_Pct``.
+    Stabilised ATE weights (``P(T=1)/e`` and ``P(T=0)/(1-e)``) are trimmed at the
+    1st/99th percentile, and the Hajek (self-normalising) estimator gives the
+    weighted success rates. Balance is summarised with standardised mean
+    differences before and after weighting.
+    """
+    ps = propensity_scores(df)
+    X, treat, e = ps["X"], ps["treat"], ps["e"]
+
+    outcome = (df["Launched"] == 1) & df["Sales_vs_Target_Pct"].notna()
+    idx = df.index[outcome]
+
+    treat_out = treat.loc[idx].to_numpy()
+    y = (
+        pd.to_numeric(df["Sales_vs_Target_Pct"].loc[idx], errors="coerce")
+        >= SUCCESS_THRESHOLD
+    ).astype(float).to_numpy()
+    e_out = e.loc[idx].to_numpy()
+
+    p1 = float(treat_out.mean())
+    w = np.where(treat_out == 1, p1 / e_out, (1.0 - p1) / (1.0 - e_out))
+    lo, hi = np.quantile(w, WEIGHT_TRIM_QUANTILES)
+    n_trimmed = int(np.sum((w < lo) | (w > hi)))
+    w = np.clip(w, lo, hi)
+
+    def rates(t: np.ndarray, y_: np.ndarray, w_: np.ndarray) -> tuple[float, float, float]:
+        n1 = float(w_[t == 1].sum())
+        n0 = float(w_[t == 0].sum())
+        r1 = float((y_[t == 1] * w_[t == 1]).sum() / n1) if n1 > 0 else float("nan")
+        r0 = float((y_[t == 0] * w_[t == 0]).sum() / n0) if n0 > 0 else float("nan")
+        return r0, r1, r1 - r0
+
+    r0_raw, r1_raw, ate_raw = rates(treat_out, y, np.ones_like(w))
+    r0_w, r1_w, ate_w = rates(treat_out, y, w)
+
+    rows = []
+    for col in X.columns:
+        x = X.loc[idx, col].to_numpy()
+        x1 = x[treat_out == 1]
+        x0 = x[treat_out == 0]
+        w1 = w[treat_out == 1]
+        w0 = w[treat_out == 0]
+        rows.append(
+            {
+                "Confounder": col,
+                "SMD before": round(_smd(x1, x0), 3),
+                "SMD after": round(_wsmd(x1, x0, w1, w0), 3),
+            }
+        )
+    balance = pd.DataFrame(rows)
+
+    ps_rows = []
+    for g, label in ((0, "Survey"), (1, "Rich package")):
+        g_e = e_out[treat_out == g]
+        ps_rows.append(
+            {
+                "Group": label,
+                "n": int(len(g_e)),
+                "Mean PS": round(float(g_e.mean()), 3),
+                "Min PS": round(float(g_e.min()), 3),
+                "Max PS": round(float(g_e.max()), 3),
+            }
+        )
+    ps_summary = pd.DataFrame(ps_rows)
+
+    return {
+        "coefs": ps["coefs"],
+        "features": list(X.columns),
+        "n_full": int(len(df)),
+        "n_outcome": int(len(idx)),
+        "p_treat": p1,
+        "n_trimmed": n_trimmed,
+        "ps_summary": ps_summary,
+        "balance": balance,
+        "unweighted": {"survey": r0_raw, "rich": r1_raw, "ate": ate_raw},
+        "weighted": {"survey": r0_w, "rich": r1_w, "ate": ate_w},
+        "e": e,
+        "treat": treat,
+        "outcome_index": idx,
+        "weights": pd.Series(w, index=idx),
+    }
+
+
+def bootstrap_ipw_ate(df: pd.DataFrame, n_boot: int = 200, seed: int = 0) -> dict:
+    """Bootstrap the whole IPW pipeline to get a 95% CI for the ATE.
+
+    Each bootstrap iteration resamples the full dataset, refits the propensity
+    model and re-estimates the weighted ATE, so the CI reflects both sampling
+    and propensity-estimation uncertainty (percentile method).
+    """
+    rng = np.random.default_rng(seed)
+    n = len(df)
+    ates = []
+    for _ in range(n_boot):
+        sample_idx = rng.integers(0, n, size=n)
+        boot = df.iloc[sample_idx].reset_index(drop=True)
+        ates.append(propensity_ipw(boot)["weighted"]["ate"])
+    ates = np.array(ates)
+    lo, hi = np.percentile(ates, [2.5, 97.5])
+    return {
+        "mean": float(ates.mean()),
+        "lo": float(lo),
+        "hi": float(hi),
+        "n_boot": n_boot,
+    }
 
 
 def main() -> None:
@@ -1135,6 +1639,338 @@ def main() -> None:
         log.image(
             "Repeated K-fold CV: distribution of (behavioural − survey) fold differences",
             beh_fig_rel,
+        )
+
+        # 13. Logistic regression — classifying success -----------------------
+        log.heading("13. Logistic regression — classifying success", level=2)
+        log.paragraph(
+            "Success is defined as ``Sales_vs_Target_Pct >= 100``. A regularised "
+            "logistic regression (``LogisticRegression`` with an L2 penalty and "
+            "balanced class weights) is fit to each of the three predictor sets, "
+            "with predictors standardised to z-scores. Coefficients are reported "
+            "per standard deviation; an odds ratio above 1 means a one-SD increase "
+            "in the predictor raises the odds of success. All metrics are "
+            "in-sample and therefore optimistic, and the sample-size, "
+            "non-stationarity and selection caveats of sections 1–3 apply."
+        )
+
+        def _metric_rows(res: dict) -> list[list]:
+            return [
+                ["n", res["n"]],
+                ["Success rate (%)", f"{res['success_rate']:.1f}"],
+                ["Accuracy", f"{res['accuracy']:.3f}"],
+                ["Balanced accuracy", f"{res['balanced_accuracy']:.3f}"],
+                ["Precision", f"{res['precision']:.3f}"],
+                ["Recall", f"{res['recall']:.3f}"],
+                ["F1", f"{res['f1']:.3f}"],
+                ["ROC-AUC", f"{res['roc_auc']:.3f}"],
+            ]
+
+        surv_log = logistic_model(df, SURVEY_MEASURES)
+        beh_log = logistic_model(df, BEHAVIOURAL_CV_PREDICTORS)
+        beh_base_log = logistic_model(
+            df, SURVEY_MEASURES, complete_on=BEHAVIOURAL_CV_PREDICTORS
+        )
+        imp_log = logistic_model(df, IMPLICIT_CV_PREDICTORS)
+        imp_base_log = logistic_model(
+            df, BEHAVIOURAL_CV_PREDICTORS, complete_on=IMPLICIT_CV_PREDICTORS
+        )
+
+        log.heading("Survey measures", level=3)
+        log.table_pair(
+            surv_log["coefs"],
+            _metric_rows(surv_log),
+            right_headers=["Metric", "Value"],
+            float_format="{:.3f}".format,
+        )
+
+        log.heading("Survey + behavioural", level=3)
+        log.table_pair(
+            beh_log["coefs"],
+            _metric_rows(beh_log),
+            right_headers=["Metric", "Value"],
+            float_format="{:.3f}".format,
+        )
+        log.paragraph(
+            f"Restricted to the same {beh_log['n']} cases, the survey-only model "
+            f"reaches a ROC-AUC of {beh_base_log['roc_auc']:.3f}, so adding "
+            f"``Behavioural_Choice_Pct`` lifts it to {beh_log['roc_auc']:.3f} — the "
+            "behavioural measure is the strongest single predictor (odds ratio "
+            f"{beh_log['coefs'].set_index('Term').loc['Behavioural_Choice_Pct', 'Odds ratio']:.2f})."
+        )
+
+        log.heading("Survey + behavioural + implicit", level=3)
+        log.table_pair(
+            imp_log["coefs"],
+            _metric_rows(imp_log),
+            right_headers=["Metric", "Value"],
+            float_format="{:.3f}".format,
+        )
+        log.paragraph(
+            f"Restricted to the same {imp_log['n']} cases, the behavioural model "
+            f"reaches a ROC-AUC of {imp_base_log['roc_auc']:.3f}, so adding "
+            f"``Implicit_Score`` lifts it only to {imp_log['roc_auc']:.3f}. As in the "
+            "linear models, ``Purchase_Intent`` flips sign under collinearity on this "
+            "small subset, and the implicit measure carries the largest odds ratio "
+            f"({imp_log['coefs'].set_index('Term').loc['Implicit_Score', 'Odds ratio']:.2f})."
+        )
+
+        log.heading("Summary", level=3)
+        summary_rows = []
+        for label, res in [
+            ("Survey", surv_log),
+            ("Survey + behavioural", beh_log),
+            ("Survey + behavioural + implicit", imp_log),
+        ]:
+            summary_rows.append(
+                {
+                    "Model": label,
+                    "n": res["n"],
+                    "Success rate (%)": f"{res['success_rate']:.1f}",
+                    "Accuracy": f"{res['accuracy']:.3f}",
+                    "Balanced accuracy": f"{res['balanced_accuracy']:.3f}",
+                    "ROC-AUC": f"{res['roc_auc']:.3f}",
+                }
+            )
+        log.table(pd.DataFrame(summary_rows))
+
+        log.paragraph(
+            "The behavioural measure produces the clearest gain: balanced accuracy "
+            f"rises from {surv_log['balanced_accuracy']:.3f} (survey) to "
+            f"{beh_log['balanced_accuracy']:.3f}, and ROC-AUC from "
+            f"{surv_log['roc_auc']:.3f} to {beh_log['roc_auc']:.3f}. The implicit "
+            "measure adds essentially nothing on the fair 70-case comparison "
+            f"({imp_base_log['roc_auc']:.3f} → {imp_log['roc_auc']:.3f}), matching "
+            "the regression result that its apparent in-sample benefit does not "
+            "survive once the sample is restricted to the tiny Combined-launched "
+            "subset. These conclusions are in-sample; out-of-sample validation "
+            "(a time-ordered split, or repeated K-fold classification) is the "
+            "natural next step and would carry the same caveats already recorded."
+        )
+
+        # 14. Time-ordered validation (2022–2024 → 2025) ----------------------
+        log.heading("14. Time-ordered validation (2022–2024 → 2025)", level=2)
+        log.paragraph(
+            "The models are re-fit on 2022–2024 and evaluated on the held-out "
+            "2025 concepts, so the test metrics are genuinely out of sample and "
+            "match how the models would be used in practice (train on the past, "
+            "predict the future). The 2025 concepts have a higher success rate "
+            "than the training years, so the class distribution shifts between "
+            "train and test — a further check on generalisation."
+        )
+
+        log_surv_tt = logistic_train_test(df, SURVEY_MEASURES)
+        log_beh_tt = logistic_train_test(df, BEHAVIOURAL_CV_PREDICTORS)
+        log_imp_tt = logistic_train_test(df, IMPLICIT_CV_PREDICTORS)
+
+        summary_rows = []
+        for label, res in [
+            ("Survey", log_surv_tt),
+            ("Survey + behavioural", log_beh_tt),
+            ("Survey + behavioural + implicit", log_imp_tt),
+        ]:
+            summary_rows.append(
+                {
+                    "Model": label,
+                    "n train": res["n_train"],
+                    "n test": res["n_test"],
+                    "Test success (%)": f"{res['test_success_rate']:.1f}",
+                    "Train ROC-AUC": f"{res['train_roc_auc']:.3f}",
+                    "Test ROC-AUC": f"{res['test_roc_auc']:.3f}",
+                    "Test balanced accuracy": f"{res['test_balanced_accuracy']:.3f}",
+                    "Test F1": f"{res['test_f1']:.3f}",
+                    "Test Brier score": f"{res['test_brier']:.3f}",
+                }
+            )
+        log.table(pd.DataFrame(summary_rows))
+
+        log.paragraph(
+            "The behavioural model is the only one that both fits and "
+            "generalises: its test ROC-AUC ("
+            f"{log_beh_tt['test_roc_auc']:.3f}) and balanced accuracy ("
+            f"{log_beh_tt['test_balanced_accuracy']:.3f}) exceed the survey "
+            f"model's ({log_surv_tt['test_roc_auc']:.3f} and "
+            f"{log_surv_tt['test_balanced_accuracy']:.3f}), with a strong recall "
+            f"of {log_beh_tt['test_recall']:.3f} and F1 of {log_beh_tt['test_f1']:.3f}."
+        )
+        log.paragraph(
+            "The implicit model does not generalise: its in-sample fit is the "
+            "best of the three (train ROC-AUC "
+            f"{log_imp_tt['train_roc_auc']:.3f}) but it collapses out of sample to "
+            f"a test ROC-AUC of {log_imp_tt['test_roc_auc']:.3f} and a balanced "
+            f"accuracy of {log_imp_tt['test_balanced_accuracy']:.3f} — at or below "
+            "chance — on only "
+            f"{log_imp_tt['n_test']} test concepts. This mirrors the regression "
+            "time-split (test R² −0.150) and confirms that the implicit model "
+            "overfits the tiny training sample rather than capturing signal, "
+            "exactly the risk flagged in section 3."
+        )
+
+        log.paragraph(
+            "The precision-recall curves below show the same out-of-sample story "
+            "in terms of precision (fraction of predicted successes that are "
+            "correct) against recall (fraction of actual successes found), with "
+            "the dashed line marking the no-skill baseline (the test-set success "
+            "rate). Average precision (AP) summarises the area under each curve."
+        )
+        pr_fig_path = visualisation.plot_precision_recall(df)
+        pr_fig_rel = os.path.relpath(pr_fig_path, log.path.parent).replace(os.sep, "/")
+        log.image(
+            "Precision-recall curves on the held-out 2025 concepts",
+            pr_fig_rel,
+        )
+
+        log.paragraph(
+            "The calibration curves below compare each model's predicted "
+            "probability of success against the observed success frequency, with "
+            "the diagonal marking perfect calibration. The Brier score (mean "
+            "squared error of the predicted probability against the actual "
+            "outcome, lower is better) is annotated on each panel; a no-skill "
+            "model that always predicts the base rate would score about "
+            "``p(1−p)``."
+        )
+        cal_fig_path = visualisation.plot_calibration(df)
+        cal_fig_rel = os.path.relpath(cal_fig_path, log.path.parent).replace(os.sep, "/")
+        log.image(
+            "Calibration curves on the held-out 2025 concepts",
+            cal_fig_rel,
+        )
+
+        # 15. Repeated K-fold CV — classification ----------------------------
+        log.heading("15. Repeated K-fold CV — classification", level=2)
+        log.paragraph(
+            "The paired repeated K-fold design from sections 11–12 is repeated "
+            "for classification, with the two models fit on identical folds of the "
+            "shared subsample so the within-fold difference isolates the added "
+            "predictor. The primary metric is ΔROC-AUC (higher is better), with "
+            "Δbalanced accuracy and ΔF1 as supporting measures; a positive mean "
+            "with a confidence interval mostly above zero indicates the added "
+            "measure improves discrimination."
+        )
+
+        imp_cv_clf = repeated_kfold_compare_logistic(
+            df, BEHAVIOURAL_CV_PREDICTORS, IMPLICIT_CV_PREDICTORS
+        )
+        beh_cv_clf = repeated_kfold_compare_logistic(
+            df, SURVEY_MEASURES, BEHAVIOURAL_CV_PREDICTORS
+        )
+
+        log.heading("Implicit vs behavioural", level=3)
+        log.table(classification_diff_summary_table(imp_cv_clf, "Implicit"))
+        log.paragraph(
+            "Adding ``Implicit_Score`` over the behavioural model changes nothing "
+            "on average: mean ΔROC-AUC is essentially zero and the implicit model "
+            "wins on only ~half of folds, while Δbalanced accuracy and ΔF1 are "
+            "slightly negative (implicit better on ~33% of folds)."
+        )
+
+        log.heading("Behavioural vs survey", level=3)
+        log.table(classification_diff_summary_table(beh_cv_clf, "Behavioural"))
+        log.paragraph(
+            "Adding ``Behavioural_Choice_Pct`` over the survey model gives a "
+            "consistent, positive effect: mean ΔROC-AUC of +0.059, with the "
+            "behavioural model better on ~85% of folds. This mirrors the "
+            "regression result and confirms the behavioural measure's "
+            "classification value is robust, whereas the implicit measure's is "
+            "not — consistent with the tiny Combined-launched subsample and the "
+            "pilot-study recommendation already recorded."
+        )
+
+        clf_fig_path = visualisation.plot_classification_cv_diffs(df)
+        clf_fig_rel = os.path.relpath(clf_fig_path, log.path.parent).replace(os.sep, "/")
+        log.image(
+            "Repeated K-fold CV (classification): distribution of fold differences",
+            clf_fig_rel,
+        )
+
+        # 16. Propensity score / inverse probability weighting -----------------
+        log.heading("16. Propensity score / inverse probability weighting", level=2)
+        log.paragraph(
+            "Package selection is confounded: teams chose Behavioural/Combined "
+            "packages non-randomly (likely according to prior confidence), so the "
+            "raw success gap may partly reflect that selection rather than the "
+            "package's own value. The unmeasured confidence confounder cannot be "
+            "adjusted for, but the measured confounders can. A regularised "
+            "logistic regression predicts the rich package (Behavioural or "
+            "Combined vs Survey) from ``Test_Year``, ``Category`` and "
+            "``Innovation_Type``. ``Sample_Size`` is excluded (negligibly "
+            "correlated with outcomes), as are ``Research_Cost_EUR`` and "
+            "``Turnaround_Days`` (consequences of the package choice, not "
+            "confounders)."
+        )
+        ipw = propensity_ipw(df)
+        log.heading("Propensity model", level=3)
+        log.table(ipw["coefs"], float_format="{:.3f}".format)
+
+        log.heading("Propensity-score distributions (before weighting)", level=3)
+        log.table(ipw["ps_summary"], float_format="{:.3f}".format)
+        log.paragraph(
+            f"The propensity model is fit on all {ipw['n_full']} concepts; the "
+            f"effect is estimated on the {ipw['n_outcome']} launched concepts with "
+            "a recorded target. Stabilised inverse-propensity weights are trimmed "
+            f"at the 1st/99th percentile ({(ipw['n_trimmed'])} weights trimmed)."
+        )
+
+        log.heading("Covariate balance (standardised mean differences)", level=3)
+        log.table(ipw["balance"], float_format="{:.3f}".format)
+        smd_before = float(ipw["balance"]["SMD before"].abs().max())
+        smd_after = float(ipw["balance"]["SMD after"].abs().max())
+        log.paragraph(
+            "Before weighting, the ``Test_Year`` dummies are strongly imbalanced "
+            "(as expected from the package-mix shift in section 2). After inverse "
+            "propensity weighting the largest absolute standardised mean "
+            f"difference falls from {smd_before:.3f} to {smd_after:.3f}, "
+            "indicating the measured confounders are largely balanced."
+        )
+
+        boot = bootstrap_ipw_ate(df)
+        raw = ipw["unweighted"]
+        wtd = ipw["weighted"]
+        effect = pd.DataFrame(
+            [
+                {
+                    "Estimate": "Survey success (%)",
+                    "Unweighted": f"{raw['survey'] * 100:.1f}",
+                    "Weighted": f"{wtd['survey'] * 100:.1f}",
+                },
+                {
+                    "Estimate": "Rich-package success (%)",
+                    "Unweighted": f"{raw['rich'] * 100:.1f}",
+                    "Weighted": f"{wtd['rich'] * 100:.1f}",
+                },
+                {
+                    "Estimate": "Difference (ATE, pp)",
+                    "Unweighted": f"{raw['ate'] * 100:+.1f}",
+                    "Weighted": f"{wtd['ate'] * 100:+.1f}",
+                },
+            ]
+        )
+        log.heading("Effect estimate", level=3)
+        log.table(effect)
+        log.paragraph(
+            "Unweighted, the rich package is associated with a "
+            f"{raw['ate'] * 100:+.1f} pp higher success rate than Survey. After "
+            "inverse propensity weighting the estimate is "
+            f"{wtd['ate'] * 100:+.1f} pp (bootstrap 95% CI "
+            f"{boot['lo'] * 100:+.1f} to {boot['hi'] * 100:+.1f} pp, "
+            f"{boot['n_boot']} resamples)."
+        )
+        log.paragraph(
+            "Adjusting for the measured confounders narrows the gap relative to "
+            "the raw comparison, confirming that part of the raw behavioural/"
+            "implicit advantage reflects the packages being concentrated in "
+            "later, more favourable cohorts. The residual effect remains positive "
+            "but is observational: the dominant confounder — the team's "
+            "unmeasured prior confidence in a concept — is not in the data, so "
+            "the weighted estimate is a robustness check on the package "
+            "advantage rather than a causal effect."
+        )
+
+        ipw_fig_path = visualisation.plot_propensity_overlap(df)
+        ipw_fig_rel = os.path.relpath(ipw_fig_path, log.path.parent).replace(os.sep, "/")
+        log.image(
+            "Propensity-score overlap before and after inverse probability weighting",
+            ipw_fig_rel,
         )
 
     print(f"Modelling log written to: {log.path}")

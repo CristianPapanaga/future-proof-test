@@ -17,9 +17,12 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from matplotlib.colors import Normalize
 from matplotlib.ticker import FuncFormatter
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import average_precision_score, precision_recall_curve
 
 import data_utilities
 import log_writer
@@ -521,6 +524,295 @@ def plot_repeated_cv_diffs(
     return path
 
 
+def plot_classification_cv_diffs(
+    df: pd.DataFrame,
+    output_dir: str | Path | None = None,
+    filename: str = "classification_cv_diffs.png",
+) -> Path:
+    """Histogram of fold-level classification metric differences.
+
+    Two rows (implicit vs behavioural, behavioural vs survey) by three columns
+    (ROC-AUC, balanced accuracy, F1). Each panel shows the distribution of
+    within-fold (full − base) differences across the repeated K-fold splits,
+    with the confidence interval shaded, a dashed line at zero, and a solid
+    line at the mean.
+    """
+    output_dir = Path(output_dir) if output_dir is not None else log_writer.FIGURES_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    comparisons = [
+        (
+            modelling.BEHAVIOURAL_CV_PREDICTORS,
+            modelling.IMPLICIT_CV_PREDICTORS,
+            "behavioural",
+            "implicit",
+        ),
+        (
+            modelling.SURVEY_MEASURES,
+            modelling.BEHAVIOURAL_CV_PREDICTORS,
+            "survey",
+            "behavioural",
+        ),
+    ]
+    metrics = [
+        ("Δ ROC-AUC", "auc_diff", "ROC-AUC"),
+        ("Δ balanced accuracy", "bal_diff", "balanced accuracy"),
+        ("Δ F1", "f1_diff", "F1"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7.6))
+
+    for row, (base, full, base_label, full_label) in enumerate(comparisons):
+        res = modelling.repeated_kfold_compare_logistic(df, base, full)
+        diff_label = f"{full_label} − {base_label}"
+        for col, (metric_title, key, metric_label) in enumerate(metrics):
+            ax = axes[row, col]
+            diffs = res[key]
+            s = modelling.summarise_fold_diffs(diffs)
+            ax.axvspan(s["ci_lo"], s["ci_hi"], color="red", alpha=0.15, zorder=0)
+            ax.hist(diffs, bins=25, color="#2c7fb8", alpha=0.85, edgecolor="white")
+            ax.axvline(0, color="black", linestyle="--", linewidth=1.5)
+            ax.axvline(s["mean"], color="black", linewidth=2)
+            ax.text(
+                0.03,
+                0.97,
+                f"mean = {s['mean']:+.3f}\n"
+                f"95% CI [{s['ci_lo']:+.3f}, {s['ci_hi']:+.3f}]\n"
+                f"{full_label} better: {s['p_positive'] * 100:.0f}% of folds",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.85),
+            )
+            ax.set_title(f"{diff_label}: {metric_title}", fontsize=11)
+            if row == 1:
+                ax.set_xlabel(f"Δ {metric_label}", fontsize=10)
+            if col == 0:
+                ax.set_ylabel("Folds", fontsize=10)
+
+    fig.suptitle(
+        "Repeated K-fold CV (classification): fold differences (full − base)",
+        fontsize=13,
+        y=0.99,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    path = output_dir / filename
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_precision_recall(
+    df: pd.DataFrame,
+    output_dir: str | Path | None = None,
+    filename: str = "precision_recall.png",
+) -> Path:
+    """Precision-recall curves for the three models on the held-out 2025 concepts.
+
+    Each panel shows the PR curve of one model (trained on 2022–2024, evaluated
+    on 2025) alongside its no-skill baseline (the test-set success prevalence,
+    shown as a dashed line) and its average precision (AP).
+    """
+    output_dir = Path(output_dir) if output_dir is not None else log_writer.FIGURES_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    models = [
+        ("Survey", modelling.SURVEY_MEASURES, "#2c7fb8"),
+        ("Survey + behavioural", modelling.BEHAVIOURAL_CV_PREDICTORS, "#31a354"),
+        (
+            "Survey + behavioural + implicit",
+            modelling.IMPLICIT_CV_PREDICTORS,
+            "#e6550d",
+        ),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), squeeze=False)
+
+    for idx, (label, predictors, colour) in enumerate(models):
+        res = modelling.logistic_train_test(df, predictors)
+        y = res["y_test"]
+        prob = res["y_prob_test"]
+
+        precision, recall, _ = precision_recall_curve(y, prob)
+        ap = float(average_precision_score(y, prob))
+        prevalence = float(y.mean())
+
+        ax = axes[0, idx]
+        ax.step(recall, precision, where="post", color=colour, linewidth=2)
+        ax.fill_between(recall, precision, step="post", color=colour, alpha=0.15)
+        ax.axhline(prevalence, color="grey", linestyle="--", linewidth=1)
+        ax.text(
+            0.55,
+            0.05,
+            f"AP = {ap:.3f}\nno-skill = {prevalence:.3f}\nn = {res['n_test']}",
+            transform=ax.transAxes,
+            va="bottom",
+            ha="left",
+            fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.85),
+        )
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(f"{label} (n = {res['n_test']})", fontsize=11)
+        ax.set_xlabel("Recall", fontsize=10)
+        if idx == 0:
+            ax.set_ylabel("Precision", fontsize=10)
+
+    fig.suptitle(
+        "Precision-recall on the held-out 2025 concepts (train 2022–2024)",
+        fontsize=13,
+        y=0.99,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    path = output_dir / filename
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_calibration(
+    df: pd.DataFrame,
+    output_dir: str | Path | None = None,
+    filename: str = "calibration.png",
+) -> Path:
+    """Calibration curves for the three models on the held-out 2025 concepts.
+
+    Two rows of panels — uniform-width binning (top) and quantile binning
+    (bottom) — with one column per model. Each panel plots the model's mean
+    predicted probability against the observed fraction of positives, alongside
+    the diagonal marking perfect calibration, and annotates the Brier score.
+    """
+    output_dir = Path(output_dir) if output_dir is not None else log_writer.FIGURES_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    models = [
+        ("Survey", modelling.SURVEY_MEASURES, "#2c7fb8"),
+        ("Survey + behavioural", modelling.BEHAVIOURAL_CV_PREDICTORS, "#31a354"),
+        (
+            "Survey + behavioural + implicit",
+            modelling.IMPLICIT_CV_PREDICTORS,
+            "#e6550d",
+        ),
+    ]
+    strategies = [
+        ("Uniform binning", "uniform", "o", "-"),
+        ("Quantile binning", "quantile", "s", "--"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8.4), squeeze=False)
+
+    for row, (strat_title, strat_name, marker, linestyle) in enumerate(strategies):
+        for col, (label, predictors, colour) in enumerate(models):
+            res = modelling.logistic_train_test(df, predictors)
+            y = res["y_test"]
+            prob = res["y_prob_test"]
+
+            fraction_pos, mean_pred = calibration_curve(
+                y, prob, n_bins=5, strategy=strat_name
+            )
+
+            ax = axes[row, col]
+            ax.plot([0, 1], [0, 1], color="grey", linestyle="--", linewidth=1)
+            ax.plot(
+                mean_pred,
+                fraction_pos,
+                marker=marker,
+                color=colour,
+                linestyle=linestyle,
+                linewidth=2,
+            )
+            ax.text(
+                0.03,
+                0.92,
+                f"Brier score = {res['test_brier']:.3f}\nn = {res['n_test']}",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.85),
+            )
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_aspect("equal", adjustable="box")
+            if row == 0:
+                ax.set_title(f"{label} (n = {res['n_test']})", fontsize=11)
+            if row == 1:
+                ax.set_xlabel("Mean predicted probability", fontsize=10)
+            if col == 0:
+                ax.set_ylabel(
+                    f"{strat_title}\nObserved success frequency", fontsize=10
+                )
+
+    fig.suptitle(
+        "Calibration on the held-out 2025 concepts (train 2022–2024)",
+        fontsize=13,
+        y=0.995,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.99])
+
+    path = output_dir / filename
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_propensity_overlap(
+    df: pd.DataFrame,
+    output_dir: str | Path | None = None,
+    filename: str = "propensity_overlap.png",
+) -> Path:
+    """Propensity-score overlap for Survey vs rich package, before and after weighting.
+
+    Two panels: the raw (unweighted) propensity-score distributions, and the
+    inverse-propensity-weighted distributions. Weighting shifts the two groups'
+    score distributions toward overlap, visually confirming that the measured
+    confounders are balanced after adjustment.
+    """
+    output_dir = Path(output_dir) if output_dir is not None else log_writer.FIGURES_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    res = modelling.propensity_ipw(df)
+    e = res["e"].loc[res["outcome_index"]]
+    treat = res["treat"].loc[res["outcome_index"]]
+    w = res["weights"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.6), squeeze=False)
+    bins = np.linspace(0, 1, 21)
+
+    for group, colour, label in ((0, "#2c7fb8", "Survey"), (1, "#e6550d", "Rich package")):
+        mask = treat == group
+        g_e = e[mask]
+        g_w = w[mask]
+        axes[0, 0].hist(g_e, bins=bins, alpha=0.5, color=colour, label=label, density=True)
+        axes[0, 1].hist(
+            g_e, bins=bins, weights=g_w, alpha=0.5, color=colour, label=label, density=True
+        )
+
+    axes[0, 0].set_title("Before weighting", fontsize=11)
+    axes[0, 1].set_title("After weighting (inverse probability)", fontsize=11)
+    for ax in axes[0]:
+        ax.set_xlabel("Propensity score (P(rich package))", fontsize=10)
+        ax.set_ylabel("Density", fontsize=10)
+        ax.set_xlim(0, 1)
+        ax.legend(fontsize=8, frameon=False)
+
+    fig.suptitle(
+        "Propensity-score overlap: Survey vs rich package",
+        fontsize=13,
+        y=0.99,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    path = output_dir / filename
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 if __name__ == "__main__":
     data = data_utilities.load_historical_data()
     full_path = plot_cross_phase_scatter(data)
@@ -546,6 +838,10 @@ if __name__ == "__main__":
         "Repeated K-fold CV: distribution of (behavioural − survey) fold differences",
         filename="repeated_cv_diffs_survey.png",
     )
+    classification_cv_path = plot_classification_cv_diffs(data)
+    precision_recall_path = plot_precision_recall(data)
+    calibration_path = plot_calibration(data)
+    propensity_path = plot_propensity_overlap(data)
     print(f"Full cross-phase grid saved to: {full_path}")
     print(f"Notable cross-phase grid saved to: {notable_path}")
     print(f"Regression fits saved to: {fits_path}")
@@ -554,4 +850,8 @@ if __name__ == "__main__":
     print(f"Time validation saved to: {validation_path}")
     print(f"Repeated CV diffs (implicit vs behavioural) saved to: {cv_diffs_path}")
     print(f"Repeated CV diffs (behavioural vs survey) saved to: {cv_diffs_survey_path}")
+    print(f"Classification CV diffs saved to: {classification_cv_path}")
+    print(f"Precision-recall curves saved to: {precision_recall_path}")
+    print(f"Calibration curves saved to: {calibration_path}")
+    print(f"Propensity-score overlap saved to: {propensity_path}")
 

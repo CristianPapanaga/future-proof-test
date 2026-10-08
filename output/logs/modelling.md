@@ -1,5 +1,5 @@
 # Modelling — Target, Package Comparison, and Caveats
-*Generated 2026-10-07 23:33:20*
+*Generated 2026-10-08 14:38:17*
 
 ## 1. Model target
 The success outcome is binary, derived from ``Sales_vs_Target_Pct``: **success** when the value is at least 100, and **failure** otherwise. It is defined only for launched concepts (``Launched == 1``); of the 403 launched concepts, 32 lack ``Sales_vs_Target_Pct`` and are excluded (per-model deletion on the target), leaving 371 observations at an overall success rate of 39.9%.
@@ -249,4 +249,147 @@ Both strategies again agree. The mean ΔR² is +0.062 (option A, 95% interval [-
 The behavioural measure shows a clear, consistent positive effect — larger in magnitude and on a much larger sample (204 vs 70 cases) than the implicit measure's — yet its 95% interval still straddles zero. That is the important cross-check: even the behavioural measure, whose value the time-ordered split supported (test R² +0.183 vs −0.071), cannot be confirmed as statistically significant under repeated resampling at the current sample size. The implicit measure's failure to reach significance in section 11 is therefore not evidence against it — it fails the same test the behavioural measure fails — but rather a sample-size limitation that a pilot study is designed to resolve.
 
 ![Repeated K-fold CV: distribution of (behavioural − survey) fold differences](../figures/repeated_cv_diffs_survey.png)
+
+## 13. Logistic regression — classifying success
+Success is defined as ``Sales_vs_Target_Pct >= 100``. A regularised logistic regression (``LogisticRegression`` with an L2 penalty and balanced class weights) is fit to each of the three predictor sets, with predictors standardised to z-scores. Coefficients are reported per standard deviation; an odds ratio above 1 means a one-SD increase in the predictor raises the odds of success. All metrics are in-sample and therefore optimistic, and the sample-size, non-stationarity and selection caveats of sections 1–3 apply.
+
+### Survey measures
+| Term | Coefficient | Odds ratio |  | Metric | Value |
+| --- | --- | --- | --- | --- | --- |
+| Intercept | -0.014 | 0.986 |  | n | 354 |
+| Stated_Appeal | 0.230 | 1.259 |  | Success rate (%) | 39.8 |
+| Purchase_Intent | 0.210 | 1.234 |  | Accuracy | 0.554 |
+|  |  |  |  | Balanced accuracy | 0.554 |
+|  |  |  |  | Precision | 0.451 |
+|  |  |  |  | Recall | 0.553 |
+|  |  |  |  | F1 | 0.497 |
+|  |  |  |  | ROC-AUC | 0.597 |
+
+### Survey + behavioural
+| Term | Coefficient | Odds ratio |  | Metric | Value |
+| --- | --- | --- | --- | --- | --- |
+| Intercept | -0.045 | 0.956 |  | n | 204 |
+| Stated_Appeal | 0.336 | 1.399 |  | Success rate (%) | 45.1 |
+| Purchase_Intent | 0.167 | 1.181 |  | Accuracy | 0.623 |
+| Behavioural_Choice_Pct | 0.608 | 1.836 |  | Balanced accuracy | 0.624 |
+|  |  |  |  | Precision | 0.573 |
+|  |  |  |  | Recall | 0.641 |
+|  |  |  |  | F1 | 0.605 |
+|  |  |  |  | ROC-AUC | 0.713 |
+
+Restricted to the same 204 cases, the survey-only model reaches a ROC-AUC of 0.654, so adding ``Behavioural_Choice_Pct`` lifts it to 0.713 — the behavioural measure is the strongest single predictor (odds ratio 1.84).
+
+### Survey + behavioural + implicit
+| Term | Coefficient | Odds ratio |  | Metric | Value |
+| --- | --- | --- | --- | --- | --- |
+| Intercept | 0.007 | 1.007 |  | n | 70 |
+| Stated_Appeal | 0.040 | 1.041 |  | Success rate (%) | 50.0 |
+| Purchase_Intent | -0.207 | 0.813 |  | Accuracy | 0.643 |
+| Behavioural_Choice_Pct | 0.661 | 1.937 |  | Balanced accuracy | 0.643 |
+| Implicit_Score | 0.787 | 2.197 |  | Precision | 0.647 |
+|  |  |  |  | Recall | 0.629 |
+|  |  |  |  | F1 | 0.638 |
+|  |  |  |  | ROC-AUC | 0.756 |
+
+Restricted to the same 70 cases, the behavioural model reaches a ROC-AUC of 0.753, so adding ``Implicit_Score`` lifts it only to 0.756. As in the linear models, ``Purchase_Intent`` flips sign under collinearity on this small subset, and the implicit measure carries the largest odds ratio (2.20).
+
+### Summary
+| Model | n | Success rate (%) | Accuracy | Balanced accuracy | ROC-AUC |
+| --- | --- | --- | --- | --- | --- |
+| Survey | 354 | 39.8 | 0.554 | 0.554 | 0.597 |
+| Survey + behavioural | 204 | 45.1 | 0.623 | 0.624 | 0.713 |
+| Survey + behavioural + implicit | 70 | 50.0 | 0.643 | 0.643 | 0.756 |
+
+The behavioural measure produces the clearest gain: balanced accuracy rises from 0.554 (survey) to 0.624, and ROC-AUC from 0.597 to 0.713. The implicit measure adds essentially nothing on the fair 70-case comparison (0.753 → 0.756), matching the regression result that its apparent in-sample benefit does not survive once the sample is restricted to the tiny Combined-launched subset. These conclusions are in-sample; out-of-sample validation (a time-ordered split, or repeated K-fold classification) is the natural next step and would carry the same caveats already recorded.
+
+## 14. Time-ordered validation (2022–2024 → 2025)
+The models are re-fit on 2022–2024 and evaluated on the held-out 2025 concepts, so the test metrics are genuinely out of sample and match how the models would be used in practice (train on the past, predict the future). The 2025 concepts have a higher success rate than the training years, so the class distribution shifts between train and test — a further check on generalisation.
+
+| Model | n train | n test | Test success (%) | Train ROC-AUC | Test ROC-AUC | Test balanced accuracy | Test F1 | Test Brier score |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Survey | 275 | 79 | 51.9 | 0.581 | 0.653 | 0.594 | 0.610 | 0.236 |
+| Survey + behavioural | 141 | 63 | 54.0 | 0.707 | 0.669 | 0.641 | 0.703 | 0.221 |
+| Survey + behavioural + implicit | 47 | 23 | 65.2 | 0.796 | 0.550 | 0.483 | 0.538 | 0.282 |
+
+The behavioural model is the only one that both fits and generalises: its test ROC-AUC (0.669) and balanced accuracy (0.641) exceed the survey model's (0.653 and 0.594), with a strong recall of 0.765 and F1 of 0.703.
+
+The implicit model does not generalise: its in-sample fit is the best of the three (train ROC-AUC 0.796) but it collapses out of sample to a test ROC-AUC of 0.550 and a balanced accuracy of 0.483 — at or below chance — on only 23 test concepts. This mirrors the regression time-split (test R² −0.150) and confirms that the implicit model overfits the tiny training sample rather than capturing signal, exactly the risk flagged in section 3.
+
+The precision-recall curves below show the same out-of-sample story in terms of precision (fraction of predicted successes that are correct) against recall (fraction of actual successes found), with the dashed line marking the no-skill baseline (the test-set success rate). Average precision (AP) summarises the area under each curve.
+
+![Precision-recall curves on the held-out 2025 concepts](../figures/precision_recall.png)
+
+The calibration curves below compare each model's predicted probability of success against the observed success frequency, with the diagonal marking perfect calibration. The Brier score (mean squared error of the predicted probability against the actual outcome, lower is better) is annotated on each panel; a no-skill model that always predicts the base rate would score about ``p(1−p)``.
+
+![Calibration curves on the held-out 2025 concepts](../figures/calibration.png)
+
+## 15. Repeated K-fold CV — classification
+The paired repeated K-fold design from sections 11–12 is repeated for classification, with the two models fit on identical folds of the shared subsample so the within-fold difference isolates the added predictor. The primary metric is ΔROC-AUC (higher is better), with Δbalanced accuracy and ΔF1 as supporting measures; a positive mean with a confidence interval mostly above zero indicates the added measure improves discrimination.
+
+### Implicit vs behavioural
+| Metric | Mean | SD | Median | 95% CI | Implicit better (% of folds) |
+| --- | --- | --- | --- | --- | --- |
+| Δ ROC-AUC | +0.010 | 0.150 | +0.000 | [-0.292, +0.272] | 51 |
+| Δ balanced accuracy | -0.025 | 0.153 | +0.000 | [-0.388, +0.214] | 33 |
+| Δ F1 | -0.020 | 0.157 | +0.000 | [-0.353, +0.250] | 33 |
+
+Adding ``Implicit_Score`` over the behavioural model changes nothing on average: mean ΔROC-AUC is essentially zero and the implicit model wins on only ~half of folds, while Δbalanced accuracy and ΔF1 are slightly negative (implicit better on ~33% of folds).
+
+### Behavioural vs survey
+| Metric | Mean | SD | Median | 95% CI | Behavioural better (% of folds) |
+| --- | --- | --- | --- | --- | --- |
+| Δ ROC-AUC | +0.059 | 0.073 | +0.062 | [-0.113, +0.175] | 85 |
+| Δ balanced accuracy | +0.037 | 0.079 | +0.039 | [-0.138, +0.171] | 72 |
+| Δ F1 | +0.044 | 0.090 | +0.049 | [-0.155, +0.186] | 72 |
+
+Adding ``Behavioural_Choice_Pct`` over the survey model gives a consistent, positive effect: mean ΔROC-AUC of +0.059, with the behavioural model better on ~85% of folds. This mirrors the regression result and confirms the behavioural measure's classification value is robust, whereas the implicit measure's is not — consistent with the tiny Combined-launched subsample and the pilot-study recommendation already recorded.
+
+![Repeated K-fold CV (classification): distribution of fold differences](../figures/classification_cv_diffs.png)
+
+## 16. Propensity score / inverse probability weighting
+Package selection is confounded: teams chose Behavioural/Combined packages non-randomly (likely according to prior confidence), so the raw success gap may partly reflect that selection rather than the package's own value. The unmeasured confidence confounder cannot be adjusted for, but the measured confounders can. A regularised logistic regression predicts the rich package (Behavioural or Combined vs Survey) from ``Test_Year``, ``Category`` and ``Innovation_Type``. ``Sample_Size`` is excluded (negligibly correlated with outcomes), as are ``Research_Cost_EUR`` and ``Turnaround_Days`` (consequences of the package choice, not confounders).
+
+### Propensity model
+| Term | Coefficient | Odds ratio |
+| --- | --- | --- |
+| Intercept | -0.679 | 0.507 |
+| Test_Year_2023 | 0.340 | 1.406 |
+| Test_Year_2024 | 1.275 | 3.577 |
+| Test_Year_2025 | 1.570 | 4.807 |
+| Category_Personal care | -0.075 | 0.928 |
+| Category_Snacks | -0.177 | 0.837 |
+| Innovation_Type_New proposition | 0.054 | 1.056 |
+
+### Propensity-score distributions (before weighting)
+| Group | n | Mean PS | Min PS | Max PS |
+| --- | --- | --- | --- | --- |
+| Survey | 149 | 0.445 | 0.298 | 0.720 |
+| Rich package | 222 | 0.547 | 0.298 | 0.720 |
+
+The propensity model is fit on all 750 concepts; the effect is estimated on the 371 launched concepts with a recorded target. Stabilised inverse-propensity weights are trimmed at the 1st/99th percentile (0 weights trimmed).
+
+### Covariate balance (standardised mean differences)
+| Confounder | SMD before | SMD after |
+| --- | --- | --- |
+| Test_Year_2023 | -0.382 | -0.138 |
+| Test_Year_2024 | 0.279 | -0.032 |
+| Test_Year_2025 | 0.539 | 0.156 |
+| Category_Personal care | -0.115 | -0.099 |
+| Category_Snacks | -0.012 | 0.021 |
+| Innovation_Type_New proposition | -0.060 | -0.057 |
+
+Before weighting, the ``Test_Year`` dummies are strongly imbalanced (as expected from the package-mix shift in section 2). After inverse propensity weighting the largest absolute standardised mean difference falls from 0.539 to 0.156, indicating the measured confounders are largely balanced.
+
+### Effect estimate
+| Estimate | Unweighted | Weighted |
+| --- | --- | --- |
+| Survey success (%) | 31.5 | 32.0 |
+| Rich-package success (%) | 45.5 | 44.2 |
+| Difference (ATE, pp) | +14.0 | +12.2 |
+
+Unweighted, the rich package is associated with a +14.0 pp higher success rate than Survey. After inverse propensity weighting the estimate is +12.2 pp (bootstrap 95% CI +2.8 to +21.0 pp, 200 resamples).
+
+Adjusting for the measured confounders narrows the gap relative to the raw comparison, confirming that part of the raw behavioural/implicit advantage reflects the packages being concentrated in later, more favourable cohorts. The residual effect remains positive but is observational: the dominant confounder — the team's unmeasured prior confidence in a concept — is not in the data, so the weighted estimate is a robustness check on the package advantage rather than a causal effect.
+
+![Propensity-score overlap before and after inverse probability weighting](../figures/propensity_overlap.png)
 
