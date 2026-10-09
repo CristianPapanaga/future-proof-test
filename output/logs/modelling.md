@@ -1,5 +1,5 @@
 # Modelling — Target, Package Comparison, and Caveats
-*Generated 2026-10-08 14:38:17*
+*Generated 2026-10-09 05:31:26*
 
 ## 1. Model target
 The success outcome is binary, derived from ``Sales_vs_Target_Pct``: **success** when the value is at least 100, and **failure** otherwise. It is defined only for launched concepts (``Launched == 1``); of the 403 launched concepts, 32 lack ``Sales_vs_Target_Pct`` and are excluded (per-model deletion on the target), leaving 371 observations at an overall success rate of 39.9%.
@@ -392,4 +392,231 @@ Unweighted, the rich package is associated with a +14.0 pp higher success rate t
 Adjusting for the measured confounders narrows the gap relative to the raw comparison, confirming that part of the raw behavioural/implicit advantage reflects the packages being concentrated in later, more favourable cohorts. The residual effect remains positive but is observational: the dominant confounder — the team's unmeasured prior confidence in a concept — is not in the data, so the weighted estimate is a robustness check on the package advantage rather than a causal effect.
 
 ![Propensity-score overlap before and after inverse probability weighting](../figures/propensity_overlap.png)
+
+## 17. Cost-benefit analysis — is the behavioural package worth its added cost?
+The behavioural screen predicts launch success better than the survey screen (sections 11-15). This section asks whether that extra predictive value is worth the behavioural package's added research cost. The decision is a go/no-go launch call made from a predicted probability of success (``Sales_vs_Target_Pct >= 100``); the baseline to beat is the survey screen making the same call on the same concepts.
+
+### Cost model
+Each concept has four possible outcomes. A true positive (launch of a winner) and a true negative (stop of a loser) cost nothing. A false positive (launch of a loser) costs the median ``Launch_Support_EUR``. A false negative (stop of a winner) costs the missed profit, which is not an observation in the data, so on the first pass it is set equal to the false-positive cost. The behavioural package's added cost relative to Survey is the exploration-log delta.
+
+| Key | Value |
+| --- | --- |
+| C_FP — launch a loser | €74,350 |
+| C_FN — stop a winner (first pass) | €74,350 |
+| Launch_Support_EUR IQR | €59,175 - €87,225 |
+| Behavioural premium vs Survey | €3,214 / concept |
+
+### Evaluation set, folds and calibration
+The evaluation set is the 204 launched concepts with behavioural measures (Behavioural + Combined packages). Both screens are fit on identical folds of the repeated K-fold design (140 folds, 4080 out-of-fold predictions) at a success base rate of 45.1%.
+
+| Screen | Raw Brier | Recalibrated Brier | Base-rate Brier |
+| --- | --- | --- | --- |
+| Survey | 0.235 | 0.235 | 0.248 |
+| Behavioural | 0.222 | 0.222 | 0.248 |
+
+The models use balanced class weights, which shift the intercept and can bias raw probabilities toward 0.5, so each fold's probabilities are Platt-recalibrated (a sigmoid fit on the training probabilities) before thresholding. Here the base rate is close to 50%, so the recalibration changes the probabilities only marginally (Brier scores above are essentially unchanged); the sweep below still uses the recalibrated probabilities, a precondition for the analytical threshold to be optimal.
+
+### Confusion-matrix sweep
+For every threshold ``t`` in [0, 1] (steps of 0.05) the recalibrated probabilities are thresholded into launch/stop decisions and the TP/TN/FP/FN counts are tallied across all held-out folds, separately for each screen.
+
+#### Survey screen
+| t | TP | FP | TN | FN |
+| --- | --- | --- | --- | --- |
+| 0.00 | 1840 | 2240 | 0 | 0 |
+| 0.05 | 1840 | 2240 | 0 | 0 |
+| 0.10 | 1840 | 2239 | 1 | 0 |
+| 0.15 | 1828 | 2212 | 28 | 12 |
+| 0.20 | 1810 | 2125 | 115 | 30 |
+| 0.25 | 1771 | 1915 | 325 | 69 |
+| 0.30 | 1660 | 1749 | 491 | 180 |
+| 0.35 | 1579 | 1512 | 728 | 261 |
+| 0.40 | 1348 | 1277 | 963 | 492 |
+| 0.45 | 1059 | 951 | 1289 | 781 |
+| 0.50 | 812 | 635 | 1605 | 1028 |
+| 0.55 | 594 | 392 | 1848 | 1246 |
+| 0.60 | 409 | 268 | 1972 | 1431 |
+| 0.65 | 241 | 147 | 2093 | 1599 |
+| 0.70 | 117 | 48 | 2192 | 1723 |
+| 0.75 | 65 | 21 | 2219 | 1775 |
+| 0.80 | 41 | 2 | 2238 | 1799 |
+| 0.85 | 26 | 0 | 2240 | 1814 |
+| 0.90 | 4 | 0 | 2240 | 1836 |
+| 0.95 | 0 | 0 | 2240 | 1840 |
+| 1.00 | 0 | 0 | 2240 | 1840 |
+
+#### Behavioural screen
+| t | TP | FP | TN | FN |
+| --- | --- | --- | --- | --- |
+| 0.00 | 1840 | 2240 | 0 | 0 |
+| 0.05 | 1832 | 2234 | 6 | 8 |
+| 0.10 | 1811 | 2142 | 98 | 29 |
+| 0.15 | 1796 | 2031 | 209 | 44 |
+| 0.20 | 1761 | 1856 | 384 | 79 |
+| 0.25 | 1694 | 1683 | 557 | 146 |
+| 0.30 | 1653 | 1521 | 719 | 187 |
+| 0.35 | 1537 | 1301 | 939 | 303 |
+| 0.40 | 1340 | 1084 | 1156 | 500 |
+| 0.45 | 1163 | 908 | 1332 | 677 |
+| 0.50 | 982 | 723 | 1517 | 858 |
+| 0.55 | 808 | 511 | 1729 | 1032 |
+| 0.60 | 644 | 314 | 1926 | 1196 |
+| 0.65 | 501 | 156 | 2084 | 1339 |
+| 0.70 | 351 | 70 | 2170 | 1489 |
+| 0.75 | 212 | 37 | 2203 | 1628 |
+| 0.80 | 98 | 3 | 2237 | 1742 |
+| 0.85 | 32 | 0 | 2240 | 1808 |
+| 0.90 | 13 | 0 | 2240 | 1827 |
+| 0.95 | 0 | 0 | 2240 | 1840 |
+| 1.00 | 0 | 0 | 2240 | 1840 |
+
+### Expected cost against threshold
+Each confusion matrix is converted to an expected cost per concept by applying the FP and FN costs to the corresponding cells (TP and TN cost nothing) and summing. The curve is plotted below for both screens; lower cost is better, so the cost-minimising threshold is the optimum (equivalently, the value-maximising threshold).
+
+![Expected cost per concept against the decision threshold](../figures/cost_benefit_ev.png)
+
+### Cost-minimising threshold
+For a calibrated model with correct decisions free of charge, the cost-minimising threshold is ``t* = C_FP / (C_FP + C_FN)``, which is 0.500 when C_FP = C_FN. The empirical minima of the sweep sit at t = 0.55 (survey) and t = 0.65 (behavioural). The survey minimum is close to t*, but the behavioural minimum is higher, a sign its probabilities are not perfectly calibrated and that the headline net value at t* is conservative — the behavioural screen's saving peaks at a higher threshold.
+
+### Net value of switching from survey to behavioural
+| Key | Value |
+| --- | --- |
+| Optimal threshold t* | 0.500 |
+| Survey expected cost / concept | €30,305 |
+| Behavioural expected cost / concept | €28,811 |
+| Decision saving / concept (survey - behavioural) | €+1,494 |
+| Net value / concept (saving - premium) | €-1,720 |
+
+The €+1,494 per-concept saving comes from 82 fewer errors across the 4,080 held-out decisions, but that net figure hides a lop-sided composition. Relative to the survey screen at t*, the behavioural screen makes +88 more false positives (launches of losers) while making -170 fewer false negatives (stops of winners): it launches 258 more concepts overall, i.e. it operates more aggressively. Its entire error advantage is on the false-negative side, and that side is precisely where the two costs cancel at C_FP = C_FN; only when C_FN exceeds C_FP does the saving outweigh the extra false positives. This is why the net value hinges so directly on the assumed cost of a stopped winner.
+
+| Error type | Survey | Behavioural | Δ (behavioural − survey) |
+| --- | --- | --- | --- |
+| False positive (launch a loser) | 635 | 723 | +88 |
+| False negative (stop a winner) | 1,028 | 858 | -170 |
+| Total errors | 1,663 | 1,581 | -82 |
+
+Because ``Launch_Support_EUR`` is right-skewed, the net value is also reported across its interquartile range (C_FP = C_FN at Q1 and Q3). At Q1 (€59,175) the net value is €-2,025 per concept; at Q3 (€87,225) it is €-1,461 per concept.
+
+### Plausible scenario — C_FN = 1.5 × C_FP (profit, not break-even)
+The equal-cost first pass is a break-even model. In practice a launched winner's profit margin exceeds the launch spend, so the missed profit of a stopped winner (C_FN) should exceed the cost of a failed launch (C_FP). Setting C_FN = 1.5 × C_FP (here €74,350 vs €111,525) lowers the optimal threshold to t* = 0.40 — launch more aggressively, because missing a winner now costs more than launching a loser.
+
+| Key | Value |
+| --- | --- |
+| C_FP (launch a loser) | €74,350 |
+| C_FN (stop a winner) | €111,525 |
+| Optimal threshold t* | 0.40 |
+| Survey expected cost / concept | €36,719 |
+| Behavioural expected cost / concept | €33,421 |
+| Decision saving / concept (survey - behavioural) | €+3,298 |
+| Net value / concept (saving - premium) | €+84 |
+
+### Each screen at its own empirical threshold
+The theoretical break-even threshold t* = 0.5 assumes both models are calibrated. As a robustness check the net value is also computed when each screen operates at its own empirical cost-minimising threshold (t = 0.55 for survey, t = 0.65 for behavioural). This gives each screen the benefit of its best observed operating point on the held-out folds, so the saving is optimistic relative to t*.
+
+| Key | Value |
+| --- | --- |
+| Survey threshold | t = 0.55 |
+| Survey cost at that threshold | €29,849 |
+| Behavioural threshold | t = 0.65 |
+| Behavioural cost at that threshold | €27,243 |
+| Decision saving / concept (survey - behavioural) | €+2,606 |
+| Net value / concept (saving - premium) | €-608 |
+
+### Bootstrap confidence interval
+To attach uncertainty to the headline net value, a cluster bootstrap resamples the 204 concepts (with replacement) and recomputes the net value at t* from the resampled out-of-fold predictions (1,000 resamples). Resampling is done at the concept level so the within-concept correlation across the 20 CV repeats is preserved; the premium is a recorded cost and is held fixed. Because it reweights the fixed out-of-fold predictions rather than refitting, this interval reflects concept-sampling uncertainty only and should be read as a lower bound on the true uncertainty.
+
+| Net value | Point estimate (€) | 95% CI (€) |
+| --- | --- | --- |
+| Per concept | -1,720 | [-6,259, +2,617] |
+
+The interval straddles zero, so the sign of the net value is not robust at the current sample size.
+
+### Threshold-free summary (area under the cost curve)
+The net value at t* depends on a single hard threshold, which is volatile because a concept sitting just either side of t* flips its whole decision. As a threshold-independent alternative, the expected cost curve is integrated over the full [0, 1] threshold range (area under the curve, lower is better), so every threshold contributes rather than one. This averages out that single-cut-off volatility.
+
+| Key | Value |
+| --- | --- |
+| Survey AUC (€ / concept) | 34,340 |
+| Behavioural AUC (€ / concept) | 32,206 |
+| Threshold-free saving / concept | €+2,135 |
+| Threshold-free net value / concept | €-1,080 |
+
+The cluster bootstrap gives a 95% CI of [€-2,330, €+102] for the threshold-free net value, a width of €2,432 versus €8,876 for the t* figure — a 3.6× reduction. Averaging over thresholds therefore reduces variance, as expected, though the interval still straddles zero so the sign of the net value remains uncertain at this sample size.
+
+### Sensitivity to the cost of a false negative
+The missed-profit cost of a false negative is unknown, so the net value is recomputed with C_FN at the Q1/median/Q3 values plus 1.25×, 1.5×, 2×, 3× the median launch spend, and C_FP at the Q1/median/Q3 values, each cell evaluated at its own ``t*``. The grid is not monotone: because the behavioural screen's out-of-sample advantage is modest (sections 11-15), the net value is negative across most of the grid and positive only in a narrow band where C_FN modestly exceeds C_FP, collapsing at the extremes where both screens converge on the same decision.
+
+| C_FP (€) | C_FN (€) | t* | Net value / concept (€) |
+| --- | --- | --- | --- |
+| 59,175 | 59,175 | 0.500 | -2,025 |
+| 59,175 | 74,350 | 0.443 | -741 |
+| 59,175 | 87,225 | 0.404 | -852 |
+| 59,175 | 92,938 | 0.389 | -1,173 |
+| 59,175 | 111,525 | 0.347 | -1,009 |
+| 59,175 | 148,700 | 0.285 | -1,495 |
+| 59,175 | 223,050 | 0.210 | -2,532 |
+| 74,350 | 59,175 | 0.557 | -1,989 |
+| 74,350 | 74,350 | 0.500 | -1,720 |
+| 74,350 | 87,225 | 0.460 | +174 |
+| 74,350 | 92,938 | 0.444 | -25 |
+| 74,350 | 111,525 | 0.400 | +84 |
+| 74,350 | 148,700 | 0.333 | +977 |
+| 74,350 | 223,050 | 0.250 | -3,196 |
+| 87,225 | 59,175 | 0.596 | -904 |
+| 87,225 | 74,350 | 0.540 | -1,861 |
+| 87,225 | 87,225 | 0.500 | -1,461 |
+| 87,225 | 92,938 | 0.484 | -144 |
+| 87,225 | 111,525 | 0.439 | +832 |
+| 87,225 | 148,700 | 0.370 | -286 |
+| 87,225 | 223,050 | 0.281 | -1,133 |
+
+![Net value per concept over the FP/FN cost grid](../figures/cost_benefit_sensitivity.png)
+
+### Break-even false-negative cost
+At the median launch spend (C_FP = €74,350), the net value crosses from negative to positive when the false-negative cost reaches approximately **C_FN = €85,698** — that is **1.15× the launch spend**. This is the single decision number: the behavioural package pays for its premium if and only if a stopped winner's forgone profit exceeds this threshold. At higher C_FN the net value turns negative again as both screens converge on the same decision (the grid above is non-monotone).
+
+### Adding the implicit screen
+The implicit measure is only collected for Combined packages, so a three-predictor "implicit screen" (survey + behavioural + ``Implicit_Score``) can only be run on the 70 launched Combined concepts where the implicit score exists. To isolate the implicit measure's contribution, both screens are fit on identical folds of that shared subset, so the only difference is the predictor set, and the premium is the Combined-vs-Behavioural research-cost delta (€3,112 per concept).
+
+The implicit screen does **not** reduce false positives. At the equal-cost t* = 0.5 it makes +16 more false positives and only -7 fewer false negatives than the behavioural screen — i.e. it launches even more aggressively, and its whole (tiny) gain is again on the false-negative side. The net effect is +9 more errors across the 1,400 held-out decisions, so its decision cost is €525 per concept higher than the behavioural screen before any premium. Adding the €3,112 premium, the net value of the implicit screen is €-3,637 per concept — negative, on top of the behavioural screen already failing to clear its own premium at equal costs.
+
+| Error type | Behavioural | Implicit | Δ (implicit − behavioural) |
+| --- | --- | --- | --- |
+| False positive (launch a loser) | 248 | 264 | +16 |
+| False negative (stop a winner) | 287 | 280 | -7 |
+| Total errors | 535 | 544 | +9 |
+
+This is consistent with the earlier classification CV (section 15), where the implicit screen was a coin-flip over the behavioural screen on the same 70 cases (Δ ROC-AUC +0.010, better on only 51% of folds). The behavioural measure is the point of diminishing returns: the implicit measure adds research cost and no decision value, so the answer to whether it could rescue the net value by cutting false positives is no — it pushes the error mix the wrong way. If an implicit measure is ever to justify its cost, it would have to come from a much larger sample (the 70-case subset is far too small to resolve its contribution), which is again a pilot-study question.
+
+#### Implicit screen — sensitivity to FP/FN costs
+Mirroring the survey-vs-behavioural treatment, the implicit screen's net value is recomputed over the same C_FP × C_FN grid (C_FP at Q1/median/Q3 of the 70-case launch support; C_FN at Q1/median/Q3 plus 1.25×, 1.5×, 2×, 3× the median), each cell at its own ``t*``.
+
+| C_FP (€) | C_FN (€) | t* | Net value / concept (€) |
+| --- | --- | --- | --- |
+| 71,800 | 71,800 | 0.500 | -3,574 |
+| 71,800 | 81,700 | 0.468 | -4,705 |
+| 71,800 | 98,600 | 0.421 | -3,039 |
+| 71,800 | 102,125 | 0.413 | -2,801 |
+| 71,800 | 122,550 | 0.369 | -2,589 |
+| 71,800 | 163,400 | 0.305 | -3,660 |
+| 71,800 | 245,100 | 0.227 | -5,022 |
+| 81,700 | 71,800 | 0.532 | -2,297 |
+| 81,700 | 81,700 | 0.500 | -3,637 |
+| 81,700 | 98,600 | 0.453 | -4,460 |
+| 81,700 | 102,125 | 0.444 | -4,104 |
+| 81,700 | 122,550 | 0.400 | -2,558 |
+| 81,700 | 163,400 | 0.333 | -3,521 |
+| 81,700 | 245,100 | 0.250 | -5,621 |
+| 98,600 | 71,800 | 0.579 | -1,822 |
+| 98,600 | 81,700 | 0.547 | -1,585 |
+| 98,600 | 98,600 | 0.500 | -3,746 |
+| 98,600 | 102,125 | 0.491 | -4,822 |
+| 98,600 | 122,550 | 0.446 | -4,282 |
+| 98,600 | 163,400 | 0.376 | -2,895 |
+| 98,600 | 245,100 | 0.287 | -4,756 |
+
+![Implicit-screen net value per concept over the FP/FN cost grid](../figures/cost_benefit_sensitivity_implicit.png)
+
+Unlike the behavioural screen, the implicit screen has **no break-even point** within the plausible range: its net value is negative across the entire grid (C_FN up to 3× the median launch spend). The reason is structural — its decision saving is itself negative at equal costs (more false positives and hardly fewer false negatives), so no realistic false-negative cost can offset both that and the €3,112 premium. Only at an implausibly large C_FN (well beyond 3× the launch spend) would its net value turn positive.
+
+**Interpretation.** At the first-pass cost model, the behavioural package does **not yet pay for its premium** at equal costs (net value €-1,720 per concept). Its improved decisions save €1,494 per concept, which is less than the €3,214 premium. The saving is real but modest — consistent with sections 11-15, where the behavioural advantage was positive yet not statistically significant under resampling — and it exceeds the premium only in a narrow band of the cost grid. The dominant unknown is therefore the profit forgone by stopping a winner (C_FN), not the research premium; a pilot study should quantify that profit directly, because it, not the premium, decides whether the behavioural package is worth its added cost. Evaluated at each screen's own best observed threshold instead, the net value is €-608 per concept. Under the plausible profit-margin scenario (C_FN = 1.5 x C_FP), behavioural does pay for itself — €+84 per concept — though only marginally, and this positive figure inherits the same wide uncertainty as the break-even estimate.
 

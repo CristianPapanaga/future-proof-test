@@ -19,7 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, TwoSlopeNorm
 from matplotlib.ticker import FuncFormatter
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import average_precision_score, precision_recall_curve
@@ -813,6 +813,141 @@ def plot_propensity_overlap(
     return path
 
 
+def plot_cost_benefit_ev(
+    df: pd.DataFrame | None = None,
+    *,
+    result: dict | None = None,
+    output_dir=None,
+    filename: str = "cost_benefit_ev.png",
+) -> Path:
+    """Expected cost per concept against the decision threshold, both screens.
+
+    Uses the recalibrated repeated-K-fold predictions from
+    :func:`modelling.cost_benefit_analysis`. The analytical cost-minimising
+    threshold ``t*`` (base case) is marked with a vertical line; lower cost is
+    better (equivalently higher expected value).
+    """
+    if result is None:
+        result = modelling.cost_benefit_analysis(df)
+    output_dir = Path(output_dir) if output_dir is not None else log_writer.FIGURES_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    thresholds = result["thresholds"]
+    base = result["base"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(
+        thresholds, base["cost_survey"], color="#2c7fb8", lw=2, label="Survey screen"
+    )
+    ax.plot(
+        thresholds,
+        base["cost_behavioural"],
+        color="#e6550d",
+        lw=2,
+        label="Behavioural screen",
+    )
+    ax.axvline(base["t_star"], color="0.35", ls="--", lw=1, alpha=0.8)
+    ax.text(
+        base["t_star"] + 0.02,
+        0.96,
+        f"t* = {base['t_star']:.2f}",
+        transform=ax.get_xaxis_transform(),
+        va="top",
+        ha="left",
+        fontsize=10,
+    )
+    # Mark the empirical (sweep) minima of each screen.
+    minima = [
+        (base["empirical_argmin_survey"], base["empirical_cost_survey"], "#2c7fb8", "survey min"),
+        (
+            base["empirical_argmin_behavioural"],
+            base["empirical_cost_behavioural"],
+            "#e6550d",
+            "behavioural min",
+        ),
+    ]
+    for tx, cost, colour, label in minima:
+        ax.plot(
+            [tx], [cost],
+            marker="o", markersize=8, color=colour,
+            mec="white", mew=1.4, zorder=6,
+        )
+        ax.annotate(
+            f"{label} (t = {tx:.2f})",
+            xy=(tx, cost),
+            xytext=(14, 10),
+            textcoords="offset points",
+            fontsize=9,
+            color="black",
+            arrowprops=dict(arrowstyle="-", color="black", lw=0.8),
+        )
+    ax.set_xlabel("Decision threshold t (launch if p >= t)")
+    ax.set_ylabel("Expected cost per concept (EUR)")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.0f}"))
+    ax.set_xlim(0, 1)
+    ax.set_title("Cost-benefit: expected cost vs threshold (recalibrated predictions)")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+
+    path = output_dir / filename
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_cost_benefit_sensitivity(
+    df: pd.DataFrame | None = None,
+    *,
+    result: dict | None = None,
+    sensitivity: "pd.DataFrame | None" = None,
+    title: str = "Net value per concept (EUR) vs FP/FN costs",
+    output_dir=None,
+    filename: str = "cost_benefit_sensitivity.png",
+) -> Path:
+    """Heatmap of the net value per concept over the FP x FN cost grid.
+
+    Each cell is the net value (decision saving minus the premium) at that
+    (C_FP, C_FN) pair, evaluated at the pair's own ``t*``. Green is positive
+    (worth it), red negative. Pass ``sensitivity`` directly to plot a different
+    comparison's grid (e.g. the implicit screen).
+    """
+    if sensitivity is None:
+        if result is None:
+            result = modelling.cost_benefit_analysis(df)
+        sensitivity = result["sensitivity"]
+    output_dir = Path(output_dir) if output_dir is not None else log_writer.FIGURES_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    grid = sensitivity
+    mat = grid.pivot(index="C_FP", columns="C_FN", values="net_per_concept").sort_index()
+
+    fig, ax = plt.subplots(figsize=(9, 4.2))
+    vmax = float(np.abs(mat.to_numpy()).max())
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+    im = ax.imshow(mat.to_numpy(), aspect="auto", cmap="RdYlGn", norm=norm)
+
+    ax.set_xticks(range(mat.shape[1]))
+    ax.set_xticklabels([f"{c/1000:,.0f}k" for c in mat.columns], fontsize=9)
+    ax.set_yticks(range(mat.shape[0]))
+    ax.set_yticklabels([f"{c/1000:,.0f}k" for c in mat.index], fontsize=9)
+    ax.set_xlabel("C_FN - cost of stopping a winner (EUR)")
+    ax.set_ylabel("C_FP - cost of launching a loser (EUR)")
+    ax.set_title(title)
+
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            v = mat.to_numpy()[i, j]
+            ax.text(j, i, f"{v:+,.0f}", ha="center", va="center", fontsize=8)
+
+    fig.colorbar(im, ax=ax, label="Net value per concept (EUR)")
+    fig.tight_layout()
+
+    path = output_dir / filename
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 if __name__ == "__main__":
     data = data_utilities.load_historical_data()
     full_path = plot_cross_phase_scatter(data)
@@ -842,6 +977,8 @@ if __name__ == "__main__":
     precision_recall_path = plot_precision_recall(data)
     calibration_path = plot_calibration(data)
     propensity_path = plot_propensity_overlap(data)
+    cost_benefit_ev_path = plot_cost_benefit_ev(data)
+    cost_benefit_sensitivity_path = plot_cost_benefit_sensitivity(data)
     print(f"Full cross-phase grid saved to: {full_path}")
     print(f"Notable cross-phase grid saved to: {notable_path}")
     print(f"Regression fits saved to: {fits_path}")
@@ -854,4 +991,6 @@ if __name__ == "__main__":
     print(f"Precision-recall curves saved to: {precision_recall_path}")
     print(f"Calibration curves saved to: {calibration_path}")
     print(f"Propensity-score overlap saved to: {propensity_path}")
+    print(f"Cost-benefit EV saved to: {cost_benefit_ev_path}")
+    print(f"Cost-benefit sensitivity saved to: {cost_benefit_sensitivity_path}")
 

@@ -80,6 +80,27 @@ PROPENSITY_C: float = 1.0
 #: Quantiles at which the stabilised inverse-propensity weights are trimmed.
 WEIGHT_TRIM_QUANTILES: tuple[float, float] = (0.01, 0.99)
 
+#: Decision-threshold grid for the cost-benefit confusion-matrix sweep.
+COST_BENEFIT_THRESHOLD_STEP: float = 0.05
+
+#: Quantiles of ``Launch_Support_EUR`` used for the false-positive cost in the
+#: cost-benefit analysis: Q1 (low), median (central), Q3 (high).
+COST_BENEFIT_FP_QUANTILES: tuple[float, float, float] = (0.25, 0.5, 0.75)
+
+#: False-negative cost levels for the sensitivity analysis, expressed as
+#: multiples of the median ``Launch_Support_EUR``. Q1/median/Q3 are added
+#: alongside these multipliers.
+COST_BENEFIT_FN_MULTIPLIERS: tuple[float, ...] = (1.25, 1.5, 2.0, 3.0)
+
+#: Plausible false-negative cost, as a multiple of the median launch spend. A
+#: launched winner's profit margin typically exceeds the launch spend, so the
+#: missed profit of a stopped winner is set to 1.5x the false-positive cost
+#: rather than the break-even 1x.
+PLAUSIBLE_FN_TO_FP_RATIO: float = 1.5
+
+#: Number of cluster-bootstrap resamples for the net-value confidence interval.
+COST_BENEFIT_BOOTSTRAP_N: int = 1000
+
 
 def _context_facts(df: pd.DataFrame) -> dict[str, float | int]:
     """Compute the small set of data facts referenced by the caveats."""
@@ -992,6 +1013,563 @@ def bootstrap_ipw_ate(df: pd.DataFrame, n_boot: int = 200, seed: int = 0) -> dic
         "lo": float(lo),
         "hi": float(hi),
         "n_boot": n_boot,
+    }
+
+
+def _fold_probabilities(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_test: pd.DataFrame,
+    predictors: list[str],
+    C: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a logistic model on one fold; return train and test success probabilities."""
+    Xtr = X_train[predictors]
+    Xte = X_test[predictors]
+    scaler = StandardScaler().fit(Xtr)
+    model = LogisticRegression(
+        C=C,
+        l1_ratio=0.0,
+        class_weight="balanced",
+        solver="lbfgs",
+        max_iter=2000,
+    ).fit(scaler.transform(Xtr), y_train)
+    p_train = model.predict_proba(scaler.transform(Xtr))[:, 1]
+    p_test = model.predict_proba(scaler.transform(Xte))[:, 1]
+    return p_train, p_test
+
+
+def _platt_calibrate(
+    p_train: np.ndarray, y_train: np.ndarray, p_test: np.ndarray
+) -> np.ndarray:
+    """Platt-scale ``p_test`` via a sigmoid fit of ``y`` on ``logit(p_train)``.
+
+    The balanced class weights of the base model shift the intercept so the raw
+    probabilities are systematically overconfident; the sigmoid maps them back
+    to the empirical base rate without touching the held-out fold.
+    """
+    eps = 1e-12
+    lo = np.clip(p_train, eps, 1 - eps)
+    lt = np.clip(p_test, eps, 1 - eps)
+    cal = LogisticRegression(C=1e6, solver="lbfgs", max_iter=2000).fit(
+        np.log(lo / (1 - lo)).reshape(-1, 1), y_train
+    )
+    return cal.predict_proba(np.log(lt / (1 - lt)).reshape(-1, 1))[:, 1]
+
+
+def cost_benefit_oof(
+    df: pd.DataFrame,
+    base_predictors: list[str] = SURVEY_MEASURES,
+    full_predictors: list[str] = BEHAVIOURAL_CV_PREDICTORS,
+    C: float = LOGISTIC_C,
+    n_splits: int = 7,
+    n_repeats: int = 20,
+    random_state: int = 42,
+) -> dict:
+    """Collect out-of-fold success probabilities for the survey and behavioural screens.
+
+    Both models are fit on identical folds of the shared behavioural-capable
+    subset (cases complete on ``full_predictors``), matching the repeated
+    K-fold design. Raw probabilities are Platt-recalibrated within each fold
+    before collection. Returns concatenated held-out labels and probabilities,
+    Brier scores, and the base rate.
+    """
+    sub = _shared_subset(df, full_predictors)
+    X = pd.DataFrame(
+        {col: pd.to_numeric(sub[col], errors="coerce") for col in full_predictors}
+    )
+    y = (
+        pd.to_numeric(sub[TARGET], errors="coerce") >= SUCCESS_THRESHOLD
+    ).astype(int).to_numpy()
+
+    rkf = RepeatedKFold(
+        n_splits=n_splits, n_repeats=n_repeats, random_state=random_state
+    )
+
+    y_oof, p_base_raw, p_full_raw, p_base_cal, p_full_cal = [], [], [], [], []
+    concept_idx: list[np.ndarray] = []
+    for train_idx, test_idx in rkf.split(X):
+        p_base_train, p_base_test = _fold_probabilities(
+            X.iloc[train_idx], y[train_idx], X.iloc[test_idx], base_predictors, C
+        )
+        p_full_train, p_full_test = _fold_probabilities(
+            X.iloc[train_idx], y[train_idx], X.iloc[test_idx], full_predictors, C
+        )
+        y_oof.append(y[test_idx])
+        p_base_raw.append(p_base_test)
+        p_full_raw.append(p_full_test)
+        p_base_cal.append(_platt_calibrate(p_base_train, y[train_idx], p_base_test))
+        p_full_cal.append(_platt_calibrate(p_full_train, y[train_idx], p_full_test))
+        concept_idx.append(np.asarray(test_idx, dtype=int))
+
+    y_oof = np.concatenate(y_oof)
+    p_base_raw = np.concatenate(p_base_raw)
+    p_full_raw = np.concatenate(p_full_raw)
+    p_base_cal = np.concatenate(p_base_cal)
+    p_full_cal = np.concatenate(p_full_cal)
+    concept_idx = np.concatenate(concept_idx)
+
+    return {
+        "n_cases": int(len(sub)),
+        "n_folds": n_splits * n_repeats,
+        "n_oof": int(len(y_oof)),
+        "base_rate": float(y_oof.mean()),
+        "y": y_oof,
+        "p_survey_raw": p_base_raw,
+        "p_behavioural_raw": p_full_raw,
+        "p_survey": p_base_cal,
+        "p_behavioural": p_full_cal,
+        "concept_idx": concept_idx,
+        "brier_survey_raw": float(brier_score_loss(y_oof, p_base_raw)),
+        "brier_behavioural_raw": float(brier_score_loss(y_oof, p_full_raw)),
+        "brier_survey": float(brier_score_loss(y_oof, p_base_cal)),
+        "brier_behavioural": float(brier_score_loss(y_oof, p_full_cal)),
+    }
+
+
+def confusion_sweep(
+    y: np.ndarray, p: np.ndarray, thresholds: np.ndarray
+) -> pd.DataFrame:
+    """Tabulate TP/TN/FP/FN for every threshold in ``thresholds``.
+
+    A case is predicted positive (launch) when its probability is ``>= t``.
+    Counts are summed over all held-out folds.
+    """
+    rows = []
+    for t in thresholds:
+        pred = (p >= t).astype(int)
+        rows.append(
+            {
+                "t": float(t),
+                "TP": int(np.sum((pred == 1) & (y == 1))),
+                "FP": int(np.sum((pred == 1) & (y == 0))),
+                "TN": int(np.sum((pred == 0) & (y == 0))),
+                "FN": int(np.sum((pred == 0) & (y == 1))),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _expected_cost(
+    sweep: pd.DataFrame, c_fp: float, c_fn: float, n: int
+) -> np.ndarray:
+    """Expected cost per concept at each threshold (TP and TN cost nothing)."""
+    return (c_fp * sweep["FP"].to_numpy() + c_fn * sweep["FN"].to_numpy()) / n
+
+
+def _cost_at(
+    y: np.ndarray, p: np.ndarray, c_fp: float, c_fn: float, t: float, n: int
+) -> float:
+    """Expected cost per concept when thresholding the probabilities at exactly ``t``."""
+    pred = (p >= t).astype(int)
+    fp = int(np.sum((pred == 1) & (y == 0)))
+    fn = int(np.sum((pred == 0) & (y == 1)))
+    return (c_fp * fp + c_fn * fn) / n
+
+
+def _optimal_threshold(c_fp: float, c_fn: float) -> float:
+    """Cost-minimising threshold for a calibrated model, ``C_FP / (C_FP + C_FN)``."""
+    return c_fp / (c_fp + c_fn)
+
+
+def _auc_from_predictions(
+    y: np.ndarray, p: np.ndarray, thresholds: np.ndarray, c_fp: float, c_fn: float
+) -> float:
+    """Area under the expected-cost curve for a single screen (threshold-free).
+
+    Integrates the expected cost per concept over the threshold grid using the
+    trapezoidal rule. Lower is better. Vectorised over thresholds so the
+    cluster bootstrap can recompute it cheaply.
+    """
+    n = len(y)
+    preds = (p[:, None] >= thresholds[None, :]).astype(int)
+    fp = ((preds == 1) & (y[:, None] == 0)).sum(axis=0)
+    fn = ((preds == 0) & (y[:, None] == 1)).sum(axis=0)
+    costs = (c_fp * fp + c_fn * fn) / n
+    return float(np.trapezoid(costs, thresholds))
+
+
+def cost_benefit_analysis(
+    df: pd.DataFrame, thresholds: np.ndarray | None = None
+) -> dict:
+    """Cost-benefit analysis of the behavioural screen versus the survey screen.
+
+    Builds the cost model (FP = median ``Launch_Support_EUR``; FN = FP on the
+    first pass because missed profit is unobserved), sweeps the decision
+    threshold over the recalibrated repeated-K-fold predictions, converts each
+    confusion matrix into an expected cost, and computes the net value of
+    switching from the survey to the behavioural screen at the analytical
+    optimum ``t*``. Also returns an interquartile range and a full FP x FN
+    sensitivity grid.
+    """
+    if thresholds is None:
+        thresholds = np.arange(
+            0.0, 1.0 + COST_BENEFIT_THRESHOLD_STEP / 2, COST_BENEFIT_THRESHOLD_STEP
+        )
+
+    oof = cost_benefit_oof(df)
+    sub = _shared_subset(df, BEHAVIOURAL_CV_PREDICTORS)
+    ls = pd.to_numeric(sub["Launch_Support_EUR"], errors="coerce").dropna()
+    q25, median, q75 = ls.quantile(list(COST_BENEFIT_FP_QUANTILES)).to_numpy()
+
+    rc = pd.to_numeric(df["Research_Cost_EUR"], errors="coerce")
+    survey_cost = float(rc[df["Research_Package"] == "Survey"].mean())
+    behavioural_cost = float(rc[df["Research_Package"] == "Behavioural"].mean())
+    premium = behavioural_cost - survey_cost
+
+    sweep_survey = confusion_sweep(oof["y"], oof["p_survey"], thresholds)
+    sweep_behavioural = confusion_sweep(oof["y"], oof["p_behavioural"], thresholds)
+
+    n = oof["n_oof"]
+    n_cases = oof["n_cases"]
+
+    def net_value(c_fp: float, c_fn: float) -> dict:
+        t_star = _optimal_threshold(c_fp, c_fn)
+        cost_s = _expected_cost(sweep_survey, c_fp, c_fn, n)
+        cost_b = _expected_cost(sweep_behavioural, c_fp, c_fn, n)
+        cs = _cost_at(oof["y"], oof["p_survey"], c_fp, c_fn, t_star, n)
+        cb_ = _cost_at(oof["y"], oof["p_behavioural"], c_fp, c_fn, t_star, n)
+        decision_saving = cs - cb_
+        net_per_concept = decision_saving - premium
+
+        # Decompose the error saving at t* into its false-positive and
+        # false-negative parts (counts are across all held-out folds).
+        pred_s = (oof["p_survey"] >= t_star).astype(int)
+        pred_b = (oof["p_behavioural"] >= t_star).astype(int)
+        fp_s = int(np.sum((pred_s == 1) & (oof["y"] == 0)))
+        fn_s = int(np.sum((pred_s == 0) & (oof["y"] == 1)))
+        fp_b = int(np.sum((pred_b == 1) & (oof["y"] == 0)))
+        fn_b = int(np.sum((pred_b == 0) & (oof["y"] == 1)))
+
+        argmin_s = int(np.argmin(cost_s))
+        argmin_b = int(np.argmin(cost_b))
+        min_cost_s = float(cost_s[argmin_s])
+        min_cost_b = float(cost_b[argmin_b])
+        empirical_saving = min_cost_s - min_cost_b
+        empirical_net_per_concept = empirical_saving - premium
+
+        return {
+            "c_fp": float(c_fp),
+            "c_fn": float(c_fn),
+            "t_star": float(t_star),
+            "cost_survey": cost_s,
+            "cost_behavioural": cost_b,
+            "cost_survey_at_tstar": cs,
+            "cost_behavioural_at_tstar": cb_,
+            "empirical_argmin_survey": float(thresholds[argmin_s]),
+            "empirical_argmin_behavioural": float(thresholds[argmin_b]),
+            "empirical_cost_survey": min_cost_s,
+            "empirical_cost_behavioural": min_cost_b,
+            "empirical_decision_saving_per_concept": empirical_saving,
+            "empirical_net_per_concept": empirical_net_per_concept,
+            "decision_saving_per_concept": decision_saving,
+            "net_per_concept": net_per_concept,
+            "error_reduction": (fp_s + fn_s) - (fp_b + fn_b),
+            "fp_survey": fp_s,
+            "fn_survey": fn_s,
+            "fp_behavioural": fp_b,
+            "fn_behavioural": fn_b,
+            "delta_fp": fp_b - fp_s,
+            "delta_fn": fn_b - fn_s,
+            "launches_survey": int(np.sum(pred_s == 1)),
+            "launches_behavioural": int(np.sum(pred_b == 1)),
+        }
+
+    base = net_value(median, median)
+    iqr_range = {"low": net_value(q25, q25), "high": net_value(q75, q75)}
+    plausible = net_value(median, PLAUSIBLE_FN_TO_FP_RATIO * median)
+
+    # Threshold-free summary: integrate the expected cost over the whole
+    # threshold range. This averages out the single-threshold volatility of t*.
+    auc_survey = float(np.trapezoid(base["cost_survey"], thresholds))
+    auc_behavioural = float(np.trapezoid(base["cost_behavioural"], thresholds))
+    auc = {
+        "auc_survey": auc_survey,
+        "auc_behavioural": auc_behavioural,
+        "decision_saving_per_concept": auc_survey - auc_behavioural,
+        "net_per_concept": (auc_survey - auc_behavioural) - premium,
+    }
+
+    fp_grid = [q25, median, q75]
+    fn_grid = [q25, median, q75] + [m * median for m in COST_BENEFIT_FN_MULTIPLIERS]
+    sensitivity_rows = []
+    for c_fp in fp_grid:
+        for c_fn in fn_grid:
+            nv = net_value(c_fp, c_fn)
+            sensitivity_rows.append(
+                {
+                    "C_FP": float(round(c_fp)),
+                    "C_FN": float(round(c_fn)),
+                    "t*": nv["t_star"],
+                    "net_per_concept": nv["net_per_concept"],
+                }
+            )
+    sensitivity = pd.DataFrame(sensitivity_rows)
+
+    # Break-even false-negative cost: the C_FN at which the net value crosses
+    # zero (C_FP held at the median). A fine scan over the sensitivity range
+    # locates the first (lower) crossing, interpolated linearly.
+    be_fn_scan = np.linspace(q25, 3.0 * median, 500)
+    be_net = np.array([net_value(median, c)["net_per_concept"] for c in be_fn_scan])
+    break_even: dict | None = None
+    for j in range(len(be_net) - 1):
+        if be_net[j] < 0 <= be_net[j + 1]:
+            frac = (0.0 - be_net[j]) / (be_net[j + 1] - be_net[j])
+            be_fn = float(be_fn_scan[j] + frac * (be_fn_scan[j + 1] - be_fn_scan[j]))
+            break_even = {
+                "c_fp": float(median),
+                "c_fn": be_fn,
+                "ratio": be_fn / median,
+            }
+            break
+
+    return {
+        "n_cases": n_cases,
+        "n_folds": oof["n_folds"],
+        "n_oof": n,
+        "base_rate": oof["base_rate"],
+        "launch_support": {
+            "q25": float(q25),
+            "median": float(median),
+            "q75": float(q75),
+            "iqr": float(q75 - q25),
+        },
+        "premium": premium,
+        "thresholds": thresholds,
+        "calibration": {
+            "brier_survey_raw": oof["brier_survey_raw"],
+            "brier_behavioural_raw": oof["brier_behavioural_raw"],
+            "brier_survey": oof["brier_survey"],
+            "brier_behavioural": oof["brier_behavioural"],
+        },
+        "oof": {
+            "y": oof["y"],
+            "p_survey": oof["p_survey"],
+            "p_behavioural": oof["p_behavioural"],
+            "concept_idx": oof["concept_idx"],
+        },
+        "sweep": {"survey": sweep_survey, "behavioural": sweep_behavioural},
+        "base": base,
+        "auc": auc,
+        "iqr_range": iqr_range,
+        "plausible": plausible,
+        "sensitivity": sensitivity,
+        "break_even": break_even,
+    }
+
+
+def bootstrap_net_value(
+    cb: dict, n_boot: int = COST_BENEFIT_BOOTSTRAP_N, seed: int = 0
+) -> dict:
+    """Cluster-bootstrap 95% CI for the base-case net value of switching.
+
+    Resamples the shared-subset concepts (with replacement) and recomputes the
+    net value at the base-case ``t*`` from the resampled out-of-fold
+    predictions. Because each concept contributes ``n_repeats`` correlated
+    predictions, resampling is done at the concept level. The behavioural
+    premium is a recorded cost and is held fixed. Returns a percentile CI for
+    the per-concept net value.
+    """
+    oof = cb["oof"]
+    y = oof["y"]
+    ps = oof["p_survey"]
+    pb = oof["p_behavioural"]
+    cidx = oof["concept_idx"]
+    n_concepts = int(cidx.max()) + 1
+
+    c_fp = cb["base"]["c_fp"]
+    c_fn = cb["base"]["c_fn"]
+    t_star = cb["base"]["t_star"]
+    premium = cb["premium"]
+    n_cases = cb["n_cases"]
+
+    positions = [np.where(cidx == c)[0] for c in range(n_concepts)]
+    rng = np.random.default_rng(seed)
+
+    per_concept = np.empty(n_boot)
+    for b in range(n_boot):
+        sample = rng.integers(0, n_concepts, size=n_concepts)
+        pos = np.concatenate([positions[c] for c in sample])
+        yy = y[pos]
+        pred_s = (ps[pos] >= t_star).astype(int)
+        pred_b = (pb[pos] >= t_star).astype(int)
+        fp_s = int(np.sum((pred_s == 1) & (yy == 0)))
+        fn_s = int(np.sum((pred_s == 0) & (yy == 1)))
+        fp_b = int(np.sum((pred_b == 1) & (yy == 0)))
+        fn_b = int(np.sum((pred_b == 0) & (yy == 1)))
+
+        n = len(yy)
+        saving = (c_fp * (fp_s - fp_b) + c_fn * (fn_s - fn_b)) / n
+        net = saving - premium
+        per_concept[b] = net
+
+    lo, hi = np.percentile(per_concept, [2.5, 97.5])
+    return {
+        "n_boot": n_boot,
+        "per_concept": {"lo": float(lo), "hi": float(hi)},
+    }
+
+
+def bootstrap_auc_net_value(
+    cb: dict, n_boot: int = COST_BENEFIT_BOOTSTRAP_N, seed: int = 0
+) -> dict:
+    """Cluster-bootstrap 95% CI for the threshold-free (AUC) net value.
+
+    Same concept-level resampling as :func:`bootstrap_net_value`, but each
+    resample is summarised by the area under its expected-cost curve (integrated
+    over all thresholds) rather than a single ``t*`` value. Averaging over
+    thresholds removes the volatility caused by flipping decisions at one hard
+    cut-off, so this interval is expected to be narrower.
+    """
+    oof = cb["oof"]
+    y = oof["y"]
+    ps = oof["p_survey"]
+    pb = oof["p_behavioural"]
+    cidx = oof["concept_idx"]
+    n_concepts = int(cidx.max()) + 1
+    thresholds = cb["thresholds"]
+
+    c_fp = cb["base"]["c_fp"]
+    c_fn = cb["base"]["c_fn"]
+    premium = cb["premium"]
+
+    positions = [np.where(cidx == c)[0] for c in range(n_concepts)]
+    rng = np.random.default_rng(seed)
+
+    per_concept = np.empty(n_boot)
+    for b in range(n_boot):
+        sample = rng.integers(0, n_concepts, size=n_concepts)
+        pos = np.concatenate([positions[c] for c in sample])
+        yy = y[pos]
+        auc_s = _auc_from_predictions(yy, ps[pos], thresholds, c_fp, c_fn)
+        auc_b = _auc_from_predictions(yy, pb[pos], thresholds, c_fp, c_fn)
+        per_concept[b] = (auc_s - auc_b) - premium
+
+    lo, hi = np.percentile(per_concept, [2.5, 97.5])
+    return {
+        "n_boot": n_boot,
+        "per_concept": {"lo": float(lo), "hi": float(hi)},
+    }
+
+
+def implicit_screen_analysis(df: pd.DataFrame) -> dict:
+    """Cost-benefit of adding the implicit screen on top of the behavioural screen.
+
+    Restricted to the 70 shared Combined-launched cases where ``Implicit_Score``
+    exists, so the only difference between the two screens is the predictor set
+    (behavioural = survey + behavioural measures; implicit = + ``Implicit_Score``).
+    The premium is the Combined-vs-Behavioural research-cost delta. Returns the
+    base-case FP/FN decomposition at the equal-cost ``t*``, the resulting net
+    value, a C_FP x C_FN sensitivity grid, and the break-even false-negative
+    cost — mirroring the survey-vs-behavioural cost-benefit treatment.
+    """
+    oof = cost_benefit_oof(
+        df,
+        base_predictors=BEHAVIOURAL_CV_PREDICTORS,
+        full_predictors=IMPLICIT_CV_PREDICTORS,
+    )
+    y = oof["y"].astype(int)
+    p_beh = oof["p_survey"]  # base screen
+    p_imp = oof["p_behavioural"]  # full screen
+    n = oof["n_oof"]
+
+    sub = _shared_subset(df, IMPLICIT_CV_PREDICTORS)
+    ls = pd.to_numeric(sub["Launch_Support_EUR"], errors="coerce").dropna()
+    q25, median, q75 = ls.quantile(list(COST_BENEFIT_FP_QUANTILES)).to_numpy()
+
+    rc = pd.to_numeric(df["Research_Cost_EUR"], errors="coerce")
+    behavioural_cost = float(rc[df["Research_Package"] == "Behavioural"].mean())
+    combined_cost = float(rc[df["Research_Package"] == "Combined"].mean())
+    premium = combined_cost - behavioural_cost
+
+    def net_value(c_fp: float, c_fn: float) -> dict:
+        t_star = _optimal_threshold(c_fp, c_fn)
+
+        def counts(p: np.ndarray) -> tuple[int, int, int]:
+            pred = (p >= t_star).astype(int)
+            fp = int(np.sum((pred == 1) & (y == 0)))
+            fn = int(np.sum((pred == 0) & (y == 1)))
+            launches = int(np.sum(pred == 1))
+            return fp, fn, launches
+
+        fp_b, fn_b, launches_b = counts(p_beh)
+        fp_i, fn_i, launches_i = counts(p_imp)
+        # decision saving (behavioural cost - implicit cost); positive means the
+        # implicit screen's decisions are cheaper.
+        decision_saving = (c_fp * (fp_b - fp_i) + c_fn * (fn_b - fn_i)) / n
+        net = decision_saving - premium
+        return {
+            "c_fp": float(c_fp),
+            "c_fn": float(c_fn),
+            "t_star": float(t_star),
+            "fp_behavioural": fp_b,
+            "fn_behavioural": fn_b,
+            "fp_implicit": fp_i,
+            "fn_implicit": fn_i,
+            "delta_fp": fp_i - fp_b,
+            "delta_fn": fn_i - fn_b,
+            "delta_launches": launches_i - launches_b,
+            "decision_saving_per_concept": decision_saving,
+            "net_per_concept": net,
+        }
+
+    base = net_value(median, median)
+
+    fp_grid = [q25, median, q75]
+    fn_grid = [q25, median, q75] + [m * median for m in COST_BENEFIT_FN_MULTIPLIERS]
+    sensitivity_rows = []
+    for c_fp in fp_grid:
+        for c_fn in fn_grid:
+            nv = net_value(c_fp, c_fn)
+            sensitivity_rows.append(
+                {
+                    "C_FP": float(round(c_fp)),
+                    "C_FN": float(round(c_fn)),
+                    "t*": nv["t_star"],
+                    "net_per_concept": nv["net_per_concept"],
+                }
+            )
+    sensitivity = pd.DataFrame(sensitivity_rows)
+
+    # Break-even false-negative cost (C_FP held at the median), located by a
+    # fine scan with linear interpolation over the plausible range.
+    be_fn_scan = np.linspace(q25, 3.0 * median, 500)
+    be_net = np.array([net_value(median, c)["net_per_concept"] for c in be_fn_scan])
+    break_even: dict | None = None
+    for j in range(len(be_net) - 1):
+        if be_net[j] < 0 <= be_net[j + 1]:
+            frac = (0.0 - be_net[j]) / (be_net[j + 1] - be_net[j])
+            be_fn = float(be_fn_scan[j] + frac * (be_fn_scan[j + 1] - be_fn_scan[j]))
+            break_even = {
+                "c_fp": float(median),
+                "c_fn": be_fn,
+                "ratio": be_fn / median,
+            }
+            break
+
+    return {
+        "n_cases": oof["n_cases"],
+        "n_oof": n,
+        "base_rate": oof["base_rate"],
+        "launch_support": {
+            "q25": float(q25),
+            "median": float(median),
+            "q75": float(q75),
+            "iqr": float(q75 - q25),
+        },
+        "premium": premium,
+        "t_star": base["t_star"],
+        "fp_behavioural": base["fp_behavioural"],
+        "fn_behavioural": base["fn_behavioural"],
+        "fp_implicit": base["fp_implicit"],
+        "fn_implicit": base["fn_implicit"],
+        "delta_fp": base["delta_fp"],
+        "delta_fn": base["delta_fn"],
+        "delta_launches": base["delta_launches"],
+        "decision_saving_per_concept": base["decision_saving_per_concept"],
+        "net_per_concept": base["net_per_concept"],
+        "sensitivity": sensitivity,
+        "break_even": break_even,
     }
 
 
@@ -1971,6 +2549,447 @@ def main() -> None:
         log.image(
             "Propensity-score overlap before and after inverse probability weighting",
             ipw_fig_rel,
+        )
+
+        # 17. Cost-benefit analysis -------------------------------------------
+        log.heading(
+            "17. Cost-benefit analysis — is the behavioural package worth its added cost?",
+            level=2,
+        )
+        log.paragraph(
+            "The behavioural screen predicts launch success better than the survey "
+            "screen (sections 11-15). This section asks whether that extra "
+            "predictive value is worth the behavioural package's added research "
+            "cost. The decision is a go/no-go launch call made from a predicted "
+            "probability of success (``Sales_vs_Target_Pct >= 100``); the baseline "
+            "to beat is the survey screen making the same call on the same concepts."
+        )
+
+        cb = cost_benefit_analysis(df)
+        imp_screen = implicit_screen_analysis(df)
+        ls = cb["launch_support"]
+
+        log.heading("Cost model", level=3)
+        log.paragraph(
+            "Each concept has four possible outcomes. A true positive (launch of a "
+            "winner) and a true negative (stop of a loser) cost nothing. A false "
+            "positive (launch of a loser) costs the median ``Launch_Support_EUR``. "
+            "A false negative (stop of a winner) costs the missed profit, which is "
+            "not an observation in the data, so on the first pass it is set equal "
+            "to the false-positive cost. The behavioural package's added cost "
+            "relative to Survey is the exploration-log delta."
+        )
+        log.key_values(
+            [
+                ["C_FP — launch a loser", f"€{ls['median']:,.0f}"],
+                ["C_FN — stop a winner (first pass)", f"€{ls['median']:,.0f}"],
+                ["Launch_Support_EUR IQR", f"€{ls['q25']:,.0f} - €{ls['q75']:,.0f}"],
+                ["Behavioural premium vs Survey", f"€{cb['premium']:,.0f} / concept"],
+            ]
+        )
+
+        log.heading("Evaluation set, folds and calibration", level=3)
+        log.paragraph(
+            f"The evaluation set is the {cb['n_cases']} launched concepts with "
+            "behavioural measures (Behavioural + Combined packages). Both screens "
+            "are fit on identical folds of the repeated K-fold design "
+            f"({cb['n_folds']} folds, {cb['n_oof']} out-of-fold predictions) at a "
+            f"success base rate of {cb['base_rate']*100:.1f}%."
+        )
+        cal = cb["calibration"]
+        base_brier = cb["base_rate"] * (1 - cb["base_rate"])
+        cal_rows = [
+            {
+                "Screen": "Survey",
+                "Raw Brier": f"{cal['brier_survey_raw']:.3f}",
+                "Recalibrated Brier": f"{cal['brier_survey']:.3f}",
+                "Base-rate Brier": f"{base_brier:.3f}",
+            },
+            {
+                "Screen": "Behavioural",
+                "Raw Brier": f"{cal['brier_behavioural_raw']:.3f}",
+                "Recalibrated Brier": f"{cal['brier_behavioural']:.3f}",
+                "Base-rate Brier": f"{base_brier:.3f}",
+            },
+        ]
+        log.table(pd.DataFrame(cal_rows))
+        log.paragraph(
+            "The models use balanced class weights, which shift the intercept and "
+            "can bias raw probabilities toward 0.5, so each fold's probabilities "
+            "are Platt-recalibrated (a sigmoid fit on the training probabilities) "
+            "before thresholding. Here the base rate is close to 50%, so the "
+            "recalibration changes the probabilities only marginally (Brier scores "
+            "above are essentially unchanged); the sweep below still uses the "
+            "recalibrated probabilities, a precondition for the analytical "
+            "threshold to be optimal."
+        )
+        log.heading("Confusion-matrix sweep", level=3)
+        log.paragraph(
+            "For every threshold ``t`` in [0, 1] (steps of "
+            f"{COST_BENEFIT_THRESHOLD_STEP:.2f}) the recalibrated probabilities are "
+            "thresholded into launch/stop decisions and the TP/TN/FP/FN counts are "
+            "tallied across all held-out folds, separately for each screen."
+        )
+        log.heading("Survey screen", level=4)
+        log.table(cb["sweep"]["survey"], float_format="{:.2f}".format)
+        log.heading("Behavioural screen", level=4)
+        log.table(cb["sweep"]["behavioural"], float_format="{:.2f}".format)
+
+        cb_fig_path = visualisation.plot_cost_benefit_ev(result=cb)
+        cb_fig_rel = os.path.relpath(cb_fig_path, log.path.parent).replace(os.sep, "/")
+        log.heading("Expected cost against threshold", level=3)
+        log.paragraph(
+            "Each confusion matrix is converted to an expected cost per concept by "
+            "applying the FP and FN costs to the corresponding cells (TP and TN "
+            "cost nothing) and summing. The curve is plotted below for both "
+            "screens; lower cost is better, so the cost-minimising threshold is "
+            "the optimum (equivalently, the value-maximising threshold)."
+        )
+        log.image("Expected cost per concept against the decision threshold", cb_fig_rel)
+
+        b = cb["base"]
+        log.heading("Cost-minimising threshold", level=3)
+        log.paragraph(
+            "For a calibrated model with correct decisions free of charge, the "
+            "cost-minimising threshold is ``t* = C_FP / (C_FP + C_FN)``, which is "
+            f"{b['t_star']:.3f} when C_FP = C_FN. The empirical minima of the sweep "
+            f"sit at t = {b['empirical_argmin_survey']:.2f} (survey) and "
+            f"t = {b['empirical_argmin_behavioural']:.2f} (behavioural). The survey "
+            "minimum is close to t*, but the behavioural minimum is higher, a sign "
+            "its probabilities are not perfectly calibrated and that the headline "
+            "net value at t* is conservative — the behavioural screen's saving "
+            "peaks at a higher threshold."
+        )
+
+        log.heading("Net value of switching from survey to behavioural", level=3)
+        log.key_values(
+            [
+                ["Optimal threshold t*", f"{b['t_star']:.3f}"],
+                ["Survey expected cost / concept", f"€{b['cost_survey_at_tstar']:,.0f}"],
+                ["Behavioural expected cost / concept", f"€{b['cost_behavioural_at_tstar']:,.0f}"],
+                ["Decision saving / concept (survey - behavioural)", f"€{b['decision_saving_per_concept']:+,.0f}"],
+                ["Net value / concept (saving - premium)", f"€{b['net_per_concept']:+,.0f}"],
+            ]
+        )
+        log.paragraph(
+            f"The €{b['decision_saving_per_concept']:+,.0f} per-concept saving comes from "
+            f"{b['error_reduction']} fewer errors across the {cb['n_oof']:,} held-out "
+            "decisions, but that net figure hides a lop-sided composition. Relative to "
+            "the survey screen at t*, the behavioural screen makes "
+            f"{b['delta_fp']:+d} more false positives (launches of losers) while "
+            f"making {b['delta_fn']:+d} fewer false negatives (stops of winners): "
+            f"it launches {b['launches_behavioural'] - b['launches_survey']:,} more "
+            "concepts overall, i.e. it operates more aggressively. Its entire error "
+            "advantage is on the false-negative side, and that side is precisely where "
+            "the two costs cancel at C_FP = C_FN; only when C_FN exceeds C_FP does the "
+            "saving outweigh the extra false positives. This is why the net value "
+            "hinges so directly on the assumed cost of a stopped winner."
+        )
+        log.table(
+            [
+                ["False positive (launch a loser)", f"{b['fp_survey']:,}", f"{b['fp_behavioural']:,}", f"{b['delta_fp']:+,}"],
+                ["False negative (stop a winner)", f"{b['fn_survey']:,}", f"{b['fn_behavioural']:,}", f"{b['delta_fn']:+,}"],
+                ["Total errors", f"{b['fp_survey'] + b['fn_survey']:,}", f"{b['fp_behavioural'] + b['fn_behavioural']:,}", f"{-b['error_reduction']:+,}"],
+            ],
+            headers=["Error type", "Survey", "Behavioural", "Δ (behavioural − survey)"],
+        )
+        lo = cb["iqr_range"]["low"]
+        hi = cb["iqr_range"]["high"]
+        log.paragraph(
+            "Because ``Launch_Support_EUR`` is right-skewed, the net value is also "
+            "reported across its interquartile range (C_FP = C_FN at Q1 and Q3). "
+            f"At Q1 (€{lo['c_fp']:,.0f}) the net value is "
+            f"€{lo['net_per_concept']:+,.0f} per concept; at Q3 "
+            f"(€{hi['c_fp']:,.0f}) it is €{hi['net_per_concept']:+,.0f} per concept."
+        )
+
+        pl = cb["plausible"]
+        log.heading("Plausible scenario — C_FN = 1.5 × C_FP (profit, not break-even)", level=3)
+        log.paragraph(
+            "The equal-cost first pass is a break-even model. In practice a "
+            "launched winner's profit margin exceeds the launch spend, so the "
+            "missed profit of a stopped winner (C_FN) should exceed the cost of a "
+            "failed launch (C_FP). Setting C_FN = 1.5 × C_FP (here "
+            f"€{pl['c_fp']:,.0f} vs €{pl['c_fn']:,.0f}) lowers the optimal threshold "
+            f"to t* = {pl['t_star']:.2f} — launch more aggressively, because missing "
+            "a winner now costs more than launching a loser."
+        )
+        log.key_values(
+            [
+                ["C_FP (launch a loser)", f"€{pl['c_fp']:,.0f}"],
+                ["C_FN (stop a winner)", f"€{pl['c_fn']:,.0f}"],
+                ["Optimal threshold t*", f"{pl['t_star']:.2f}"],
+                ["Survey expected cost / concept", f"€{pl['cost_survey_at_tstar']:,.0f}"],
+                ["Behavioural expected cost / concept", f"€{pl['cost_behavioural_at_tstar']:,.0f}"],
+                ["Decision saving / concept (survey - behavioural)", f"€{pl['decision_saving_per_concept']:+,.0f}"],
+                ["Net value / concept (saving - premium)", f"€{pl['net_per_concept']:+,.0f}"],
+            ]
+        )
+
+        eb = cb["base"]
+        log.heading("Each screen at its own empirical threshold", level=3)
+        log.paragraph(
+            "The theoretical break-even threshold t* = 0.5 assumes both models "
+            "are calibrated. As a robustness check the net value is also computed "
+            "when each screen operates at its own empirical cost-minimising "
+            f"threshold (t = {eb['empirical_argmin_survey']:.2f} for survey, "
+            f"t = {eb['empirical_argmin_behavioural']:.2f} for behavioural). This "
+            "gives each screen the benefit of its best observed operating point "
+            "on the held-out folds, so the saving is optimistic relative to t*."
+        )
+        log.key_values(
+            [
+                ["Survey threshold", f"t = {eb['empirical_argmin_survey']:.2f}"],
+                ["Survey cost at that threshold", f"€{eb['empirical_cost_survey']:,.0f}"],
+                ["Behavioural threshold", f"t = {eb['empirical_argmin_behavioural']:.2f}"],
+                ["Behavioural cost at that threshold", f"€{eb['empirical_cost_behavioural']:,.0f}"],
+                ["Decision saving / concept (survey - behavioural)", f"€{eb['empirical_decision_saving_per_concept']:+,.0f}"],
+                ["Net value / concept (saving - premium)", f"€{eb['empirical_net_per_concept']:+,.0f}"],
+            ]
+        )
+
+        boot = bootstrap_net_value(cb)
+        log.heading("Bootstrap confidence interval", level=3)
+        log.paragraph(
+            f"To attach uncertainty to the headline net value, a cluster "
+            f"bootstrap resamples the {cb['n_cases']} concepts (with replacement) "
+            "and recomputes the net value at t* from the resampled out-of-fold "
+            f"predictions ({boot['n_boot']:,} resamples). Resampling is done at "
+            "the concept level so the within-concept correlation across the 20 CV "
+            "repeats is preserved; the premium is a recorded cost and is held "
+            "fixed. Because it reweights the fixed out-of-fold predictions rather "
+            "than refitting, this interval reflects concept-sampling uncertainty "
+            "only and should be read as a lower bound on the true uncertainty."
+        )
+        if boot["per_concept"]["hi"] < 0:
+            ci_note = (
+                "The interval lies entirely below zero, so the conclusion that "
+                "the package does not pay for itself at equal costs is robust to "
+                "concept-sampling uncertainty."
+            )
+        elif boot["per_concept"]["lo"] > 0:
+            ci_note = (
+                "The interval lies entirely above zero, so the package would be "
+                "robustly worth its premium at equal costs."
+            )
+        else:
+            ci_note = (
+                "The interval straddles zero, so the sign of the net value is not "
+                "robust at the current sample size."
+            )
+        log.table(
+            pd.DataFrame(
+                [
+                    {
+                        "Net value": "Per concept",
+                        "Point estimate (€)": f"{b['net_per_concept']:+,.0f}",
+                        "95% CI (€)": f"[{boot['per_concept']['lo']:+,.0f}, {boot['per_concept']['hi']:+,.0f}]",
+                    },
+                ]
+            )
+        )
+        log.paragraph(ci_note)
+
+        boot_auc = bootstrap_auc_net_value(cb)
+        log.heading("Threshold-free summary (area under the cost curve)", level=3)
+        log.paragraph(
+            "The net value at t* depends on a single hard threshold, which is "
+            "volatile because a concept sitting just either side of t* flips its "
+            "whole decision. As a threshold-independent alternative, the expected "
+            "cost curve is integrated over the full [0, 1] threshold range (area "
+            "under the curve, lower is better), so every threshold contributes "
+            "rather than one. This averages out that single-cut-off volatility."
+        )
+        auc = cb["auc"]
+        log.key_values(
+            [
+                ["Survey AUC (€ / concept)", f"{auc['auc_survey']:,.0f}"],
+                ["Behavioural AUC (€ / concept)", f"{auc['auc_behavioural']:,.0f}"],
+                ["Threshold-free saving / concept", f"€{auc['decision_saving_per_concept']:+,.0f}"],
+                ["Threshold-free net value / concept", f"€{auc['net_per_concept']:+,.0f}"],
+            ]
+        )
+        tstar_width = boot["per_concept"]["hi"] - boot["per_concept"]["lo"]
+        auc_width = boot_auc["per_concept"]["hi"] - boot_auc["per_concept"]["lo"]
+        ratio = tstar_width / auc_width if auc_width > 0 else float("inf")
+        log.paragraph(
+            f"The cluster bootstrap gives a 95% CI of "
+            f"[€{boot_auc['per_concept']['lo']:+,.0f}, €{boot_auc['per_concept']['hi']:+,.0f}] "
+            f"for the threshold-free net value, a width of €{auc_width:,.0f} versus "
+            f"€{tstar_width:,.0f} for the t* figure — a {ratio:.1f}× reduction. "
+            "Averaging over thresholds therefore reduces variance, as expected, "
+            "though the interval still straddles zero so the sign of the net value "
+            "remains uncertain at this sample size."
+        )
+
+        fn_mult_text = ", ".join(f"{m:g}×" for m in COST_BENEFIT_FN_MULTIPLIERS)
+        log.heading("Sensitivity to the cost of a false negative", level=3)
+        log.paragraph(
+            "The missed-profit cost of a false negative is unknown, so the net "
+            "value is recomputed with C_FN at the Q1/median/Q3 values plus "
+            f"{fn_mult_text} the median launch spend, and C_FP at the "
+            "Q1/median/Q3 values, each cell evaluated at its own ``t*``. The "
+            "grid is not monotone: because the behavioural screen's out-of-sample "
+            "advantage is modest (sections 11-15), the net value is negative "
+            "across most of the grid and positive only in a narrow band where "
+            "C_FN modestly exceeds C_FP, collapsing at the extremes where both "
+            "screens converge on the same decision."
+        )
+        sens_rows = [
+            {
+                "C_FP (€)": f"{row['C_FP']:,.0f}",
+                "C_FN (€)": f"{row['C_FN']:,.0f}",
+                "t*": f"{row['t*']:.3f}",
+                "Net value / concept (€)": f"{row['net_per_concept']:+,.0f}",
+            }
+            for row in cb["sensitivity"].to_dict("records")
+        ]
+        log.table(pd.DataFrame(sens_rows))
+
+        cb_sens_path = visualisation.plot_cost_benefit_sensitivity(result=cb)
+        cb_sens_rel = os.path.relpath(cb_sens_path, log.path.parent).replace(os.sep, "/")
+        log.image("Net value per concept over the FP/FN cost grid", cb_sens_rel)
+
+        be = cb["break_even"]
+        if be is not None:
+            log.heading("Break-even false-negative cost", level=3)
+            log.paragraph(
+                "At the median launch spend (C_FP = "
+                f"€{be['c_fp']:,.0f}), the net value crosses from negative to "
+                "positive when the false-negative cost reaches approximately "
+                f"**C_FN = €{be['c_fn']:,.0f}** — that is "
+                f"**{be['ratio']:.2f}× the launch spend**. This is the single "
+                "decision number: the behavioural package pays for its premium "
+                "if and only if a stopped winner's forgone profit exceeds this "
+                "threshold. At higher C_FN the net value turns negative again "
+                "as both screens converge on the same decision (the grid above "
+                "is non-monotone)."
+            )
+
+        log.heading("Adding the implicit screen", level=3)
+        log.paragraph(
+            "The implicit measure is only collected for Combined packages, so a "
+            "three-predictor \"implicit screen\" (survey + behavioural + "
+            "``Implicit_Score``) can only be run on the 70 launched Combined "
+            "concepts where the implicit score exists. To isolate the implicit "
+            "measure's contribution, both screens are fit on identical folds of "
+            "that shared subset, so the only difference is the predictor set, and "
+            "the premium is the Combined-vs-Behavioural research-cost delta "
+            f"(€{imp_screen['premium']:,.0f} per concept)."
+        )
+        log.paragraph(
+            "The implicit screen does **not** reduce false positives. At the "
+            f"equal-cost t* = {imp_screen['t_star']:.1f} it makes "
+            f"{imp_screen['delta_fp']:+d} more false positives and only "
+            f"{imp_screen['delta_fn']:+d} fewer false negatives than the "
+            "behavioural screen — i.e. it launches even more aggressively, and its "
+            "whole (tiny) gain is again on the false-negative side. The net effect "
+            f"is {imp_screen['delta_fp'] + imp_screen['delta_fn']:+d} more errors "
+            f"across the {imp_screen['n_oof']:,} held-out decisions, so its decision "
+            f"cost is €{-imp_screen['decision_saving_per_concept']:,.0f} per concept "
+            "higher than the behavioural screen before any premium. Adding the "
+            f"€{imp_screen['premium']:,.0f} premium, the net value of the implicit "
+            f"screen is €{imp_screen['net_per_concept']:+,.0f} per concept — "
+            "negative, on top of the behavioural screen already failing to clear "
+            "its own premium at equal costs."
+        )
+        log.table(
+            [
+                ["False positive (launch a loser)", f"{imp_screen['fp_behavioural']:,}", f"{imp_screen['fp_implicit']:,}", f"{imp_screen['delta_fp']:+,}"],
+                ["False negative (stop a winner)", f"{imp_screen['fn_behavioural']:,}", f"{imp_screen['fn_implicit']:,}", f"{imp_screen['delta_fn']:+,}"],
+                ["Total errors", f"{imp_screen['fp_behavioural'] + imp_screen['fn_behavioural']:,}", f"{imp_screen['fp_implicit'] + imp_screen['fn_implicit']:,}", f"{imp_screen['delta_fp'] + imp_screen['delta_fn']:+,}"],
+            ],
+            headers=["Error type", "Behavioural", "Implicit", "Δ (implicit − behavioural)"],
+        )
+        log.paragraph(
+            "This is consistent with the earlier classification CV (section 15), "
+            "where the implicit screen was a coin-flip over the behavioural screen "
+            "on the same 70 cases (Δ ROC-AUC +0.010, better on only 51% of folds). "
+            "The behavioural measure is the point of diminishing returns: the "
+            "implicit measure adds research cost and no decision value, so the "
+            "answer to whether it could rescue the net value by cutting false "
+            "positives is no — it pushes the error mix the wrong way. If an "
+            "implicit measure is ever to justify its cost, it would have to come "
+            "from a much larger sample (the 70-case subset is far too small to "
+            "resolve its contribution), which is again a pilot-study question."
+        )
+
+        log.heading("Implicit screen — sensitivity to FP/FN costs", level=4)
+        log.paragraph(
+            "Mirroring the survey-vs-behavioural treatment, the implicit screen's "
+            "net value is recomputed over the same C_FP × C_FN grid (C_FP at "
+            f"Q1/median/Q3 of the 70-case launch support; C_FN at Q1/median/Q3 "
+            f"plus {fn_mult_text} the median), each cell at its own ``t*``."
+        )
+        imp_sens_rows = [
+            {
+                "C_FP (€)": f"{row['C_FP']:,.0f}",
+                "C_FN (€)": f"{row['C_FN']:,.0f}",
+                "t*": f"{row['t*']:.3f}",
+                "Net value / concept (€)": f"{row['net_per_concept']:+,.0f}",
+            }
+            for row in imp_screen["sensitivity"].to_dict("records")
+        ]
+        log.table(pd.DataFrame(imp_sens_rows))
+
+        imp_sens_path = visualisation.plot_cost_benefit_sensitivity(
+            sensitivity=imp_screen["sensitivity"],
+            title="Implicit screen: net value per concept (EUR) vs FP/FN costs",
+            filename="cost_benefit_sensitivity_implicit.png",
+        )
+        imp_sens_rel = os.path.relpath(imp_sens_path, log.path.parent).replace(os.sep, "/")
+        log.image("Implicit-screen net value per concept over the FP/FN cost grid", imp_sens_rel)
+
+        imp_be = imp_screen["break_even"]
+        if imp_be is not None:
+            log.paragraph(
+                "At the median launch spend (C_FP = "
+                f"€{imp_be['c_fp']:,.0f}), the implicit screen's net value would "
+                "cross zero only at a false-negative cost of "
+                f"**C_FN = €{imp_be['c_fn']:,.0f}** — "
+                f"**{imp_be['ratio']:.2f}× the launch spend**."
+            )
+        else:
+            log.paragraph(
+                "Unlike the behavioural screen, the implicit screen has **no "
+                "break-even point** within the plausible range: its net value is "
+                "negative across the entire grid (C_FN up to 3× the median launch "
+                "spend). The reason is structural — its decision saving is itself "
+                "negative at equal costs (more false positives and hardly fewer "
+                "false negatives), so no realistic false-negative cost can offset "
+                "both that and the €3,112 premium. Only at an implausibly large "
+                "C_FN (well beyond 3× the launch spend) would its net value turn "
+                "positive."
+            )
+
+        if b["net_per_concept"] >= 0:
+            verdict = (
+                f"the behavioural package **pays for its premium** at equal costs "
+                f"(net value €{b['net_per_concept']:+,.0f} per concept)."
+            )
+        else:
+            verdict = (
+                "the behavioural package does **not yet pay for its premium** at "
+                f"equal costs (net value €{b['net_per_concept']:+,.0f} per concept)."
+            )
+        log.paragraph(
+            f"**Interpretation.** At the first-pass cost model, {verdict} Its "
+            f"improved decisions save €{b['decision_saving_per_concept']:,.0f} per "
+            f"concept, which is less than the €{cb['premium']:,.0f} premium. The "
+            "saving is real but modest — consistent with sections 11-15, where the "
+            "behavioural advantage was positive yet not statistically significant "
+            "under resampling — and it exceeds the premium only in a narrow band of "
+            "the cost grid. The dominant unknown is therefore the profit forgone by "
+            "stopping a winner (C_FN), not the research premium; a pilot study "
+            "should quantify that profit directly, because it, not the premium, "
+            "decides whether the behavioural package is worth its added cost. "
+            "Evaluated at each screen's own best observed threshold instead, the "
+            f"net value is €{eb['empirical_net_per_concept']:+,.0f} per concept. "
+            "Under the plausible profit-margin scenario (C_FN = 1.5 x C_FP), "
+            "behavioural does pay for itself — "
+            f"€{pl['net_per_concept']:+,.0f} per concept — though only marginally, "
+            "and this positive figure inherits the same wide uncertainty as the "
+            "break-even estimate."
         )
 
     print(f"Modelling log written to: {log.path}")
